@@ -1,4 +1,4 @@
-name: BBMA Scanner
+name: BBMA XAU/USD Scanner
 
 on:
   schedule:
@@ -21,7 +21,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install yfinance pandas numpy requests
+        pip install pandas numpy requests
         
     - name: Run BBMA Scanner
       env:
