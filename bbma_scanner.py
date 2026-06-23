@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, List
+from enum import Enum
 
 # ==========================================
 # CONFIGURATION
@@ -24,6 +25,17 @@ STYLES = {
 
 BB_PERIOD = 20
 BB_STD = 2.0
+
+class BBMAState(Enum):
+    NONE = 0
+    EXTREME_BUY = 1
+    EXTREME_SELL = 2
+    MHV_BUY = 3
+    MHV_SELL = 4
+    CSA_BUY = 5
+    CSA_SELL = 6
+    REENTRY_BUY = 7
+    REENTRY_SELL = 8
 
 # ==========================================
 # INDICATOR CALCULATIONS
@@ -75,20 +87,13 @@ def fetch_twelvedata_data(symbol: str, interval: str, outputsize: int = 300) -> 
         return pd.DataFrame()
     
     try:
-        interval_map = {
-            '1h': '1h',
-            '4h': '4h',
-            '1d': '1day'
-        }
+        interval_map = {'1h': '1h', '4h': '4h', '1d': '1day'}
         td_interval = interval_map.get(interval, interval)
         
-        url = f"https://api.twelvedata.com/time_series"
+        url = "https://api.twelvedata.com/time_series"
         params = {
-            'symbol': symbol,
-            'interval': td_interval,
-            'outputsize': outputsize,
-            'apikey': TWELVEDATA_API_KEY,
-            'format': 'JSON'
+            'symbol': symbol, 'interval': td_interval,
+            'outputsize': outputsize, 'apikey': TWELVEDATA_API_KEY, 'format': 'JSON'
         }
         
         response = requests.get(url, params=params, timeout=30)
@@ -102,18 +107,18 @@ def fetch_twelvedata_data(symbol: str, interval: str, outputsize: int = 300) -> 
         df = df.iloc[::-1]
         df['datetime'] = pd.to_datetime(df['datetime'])
         
-        df = df.rename(columns={
-            'datetime': 'timestamp',
-            'open': 'open',
-            'high': 'high',
-            'low': 'low',
-            'close': 'close'
-        })
+        df = df.rename(columns={'datetime': 'timestamp'})
         
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        required = ['timestamp', 'open', 'high', 'low', 'close']
+        df = df[[c for c in required if c in df.columns]]
         if 'volume' in df.columns:
-            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
         else:
-            df = df[['timestamp', 'open', 'high', 'low', 'close']]
             df['volume'] = 0
         
         df.set_index('timestamp', inplace=True)
@@ -123,144 +128,229 @@ def fetch_twelvedata_data(symbol: str, interval: str, outputsize: int = 300) -> 
         
         return df
     except Exception as e:
-        print(f" TwelveData error {symbol}: {e}")
+        print(f"❌ TwelveData error {symbol}: {e}")
         return pd.DataFrame()
 
 # ==========================================
-# TREND CHECK
+# BBMA STATE MACHINE (STRICT OMA ALLY)
 # ==========================================
-def check_uptrend(df: pd.DataFrame) -> bool:
-    """EMA 50 below mid BB = Uptrend (for BUY)"""
-    last = df.iloc[-1]
-    return last['ema50'] < last['bb_mid']
-
-def check_downtrend(df: pd.DataFrame) -> bool:
-    """EMA 50 above mid BB = Downtrend (for SELL)"""
-    last = df.iloc[-1]
-    return last['ema50'] > last['bb_mid']
-
-# ==========================================
-# RE-ENTRY DETECTION
-# ==========================================
-def find_reentry_buy(df: pd.DataFrame) -> Optional[Dict]:
+class BBMACycleTracker:
     """
-    BUY Re-Entry:
-    1. Price retrace to MA5/10 Low zone
-    2. Close NOT below Low BB
-    3. Reverse Candle (Green after Red)
+    Tracks BBMA cycle state sequentially per Oma Ally:
+    Extreme → TPW → MHV → CSA → Re-Entry
+    Re-Entry ONLY valid after CSA. Resets on new Extreme/MHV.
     """
-    if len(df) < 3:
+    
+    def __init__(self):
+        self.state = BBMAState.NONE
+        self.extreme_price = None
+        self.mhv_price = None
+        self.csa_confirmed = False
+    
+    def reset(self):
+        self.state = BBMAState.NONE
+        self.extreme_price = None
+        self.mhv_price = None
+        self.csa_confirmed = False
+    
+    def update(self, row: pd.Series, prev_row: pd.Series) -> Optional[Dict]:
+        """
+        Process one candle and return setup dict if valid Re-Entry detected.
+        Returns None otherwise.
+        """
+        close = row['close']
+        open_ = row['open']
+        high = row['high']
+        low = row['low']
+        bb_upper = row['bb_upper']
+        bb_lower = row['bb_lower']
+        bb_mid = row['bb_mid']
+        ma5_high = row['ma5_high']
+        ma10_high = row['ma10_high']
+        ma5_low = row['ma5_low']
+        ma10_low = row['ma10_low']
+        
+        is_bullish = close > open_
+        is_bearish = close < open_
+        prev_bullish = prev_row['close'] > prev_row['open']
+        prev_bearish = prev_row['close'] < prev_row['open']
+        
+        # --- CHECK EXTREME BUY ---
+        # MA5/10 Low keluar BB Lower + Reverse Candle (Bullish after Bearish)
+        extreme_buy = (
+            (ma5_low < bb_lower or ma10_low < bb_lower) and
+            is_bullish and prev_bearish
+        )
+        
+        # --- CHECK EXTREME SELL ---
+        # MA5/10 High keluar BB Upper + Reverse Candle (Bearish after Bullish)
+        extreme_sell = (
+            (ma5_high > bb_upper or ma10_high > bb_upper) and
+            is_bearish and prev_bullish
+        )
+        
+        # New Extreme resets cycle
+        if extreme_buy:
+            self.state = BBMAState.EXTREME_BUY
+            self.extreme_price = low
+            self.mhv_price = None
+            self.csa_confirmed = False
+            return None
+        
+        if extreme_sell:
+            self.state = BBMAState.EXTREME_SELL
+            self.extreme_price = high
+            self.mhv_price = None
+            self.csa_confirmed = False
+            return None
+        
+        # --- CHECK MHV (after Extreme) ---
+        if self.state == BBMAState.EXTREME_BUY:
+            # MHV Buy: Price tak close bawah BB Lower + Reverse Candle (Bearish)
+            mhv_valid = (close >= bb_lower) and is_bearish and prev_bullish
+            if mhv_valid:
+                self.state = BBMAState.MHV_BUY
+                self.mhv_price = high
+                return None
+            # MHV batal jika close luar BB Lower
+            if close < bb_lower:
+                self.reset()
+                return None
+        
+        if self.state == BBMAState.EXTREME_SELL:
+            # MHV Sell: Price tak close atas BB Upper + Reverse Candle (Bullish)
+            mhv_valid = (close <= bb_upper) and is_bullish and prev_bearish
+            if mhv_valid:
+                self.state = BBMAState.MHV_SELL
+                self.mhv_price = low
+                return None
+            # MHV batal jika close luar BB Upper
+            if close > bb_upper:
+                self.reset()
+                return None
+        
+        # --- CHECK CSA (after MHV) ---
+        if self.state == BBMAState.MHV_BUY:
+            # CSA Buy: Close atas MA5/10 Low (early) atau atas Mid BB (strong)
+            csa_early = close > ma5_low and close > ma10_low
+            csa_strong = csa_early and close > bb_mid
+            if csa_early:
+                self.state = BBMAState.CSA_BUY
+                self.csa_confirmed = True
+                return None
+        
+        if self.state == BBMAState.MHV_SELL:
+            # CSA Sell: Close bawah MA5/10 High (early) atau bawah Mid BB (strong)
+            csa_early = close < ma5_high and close < ma10_high
+            csa_strong = csa_early and close < bb_mid
+            if csa_early:
+                self.state = BBMAState.CSA_SELL
+                self.csa_confirmed = True
+                return None
+        
+        # --- CHECK RE-ENTRY (only after CSA confirmed) ---
+        if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
+            # Re-Entry Buy: Price retrace ke MA5/10 Low zone
+            # Close TIDAK boleh melebihi MA5/10 High atau Mid BB
+            in_zone = (low <= ma5_low * 1.003) or (low <= ma10_low * 1.003)
+            valid_reentry = (
+                in_zone and
+                close <= ma5_high and
+                close <= ma10_high and
+                close <= bb_mid and
+                is_bullish and prev_bearish  # Reverse candle confirmation
+            )
+            if valid_reentry:
+                self.state = BBMAState.REENTRY_BUY
+                return {
+                    'type': 'BUY',
+                    'ma5_low': ma5_low, 'ma10_low': ma10_low,
+                    'bb_lower': bb_lower, 'bb_upper': bb_upper,
+                    'ma5_high': ma5_high, 'ma10_high': ma10_high,
+                    'bb_mid': bb_mid
+                }
+        
+        if self.state == BBMAState.CSA_SELL and self.csa_confirmed:
+            # Re-Entry Sell: Price retrace ke MA5/10 High zone
+            # Close TIDAK boleh melebihi MA5/10 Low atau Mid BB
+            in_zone = (high >= ma5_high * 0.997) or (high >= ma10_high * 0.997)
+            valid_reentry = (
+                in_zone and
+                close >= ma5_low and
+                close >= ma10_low and
+                close >= bb_mid and
+                is_bearish and prev_bullish  # Reverse candle confirmation
+            )
+            if valid_reentry:
+                self.state = BBMAState.REENTRY_SELL
+                return {
+                    'type': 'SELL',
+                    'ma5_high': ma5_high, 'ma10_high': ma10_high,
+                    'bb_upper': bb_upper, 'bb_lower': bb_lower,
+                    'ma5_low': ma5_low, 'ma10_low': ma10_low,
+                    'bb_mid': bb_mid
+                }
+        
         return None
-    
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    touch_zone = (curr['low'] <= curr['ma5_low'] * 1.003) or \
-                 (curr['low'] <= curr['ma10_low'] * 1.003)
-    
-    valid_close = curr['close'] >= curr['bb_lower']
-    
-    is_bullish = curr['close'] > curr['open']
-    prev_bearish = prev['close'] < prev['open']
-    reverse = is_bullish and prev_bearish
-    
-    if touch_zone and valid_close and reverse:
-        return {
-            'ma5_low': curr['ma5_low'],
-            'ma10_low': curr['ma10_low'],
-            'bb_lower': curr['bb_lower'],
-            'bb_upper': curr['bb_upper'],
-            'ma5_high': curr['ma5_high'],
-            'ma10_high': curr['ma10_high'],
-            'bb_mid': curr['bb_mid']
-        }
-    return None
 
-def find_reentry_sell(df: pd.DataFrame) -> Optional[Dict]:
-    """
-    SELL Re-Entry:
-    1. Price retrace to MA5/10 High zone
-    2. Close NOT above Top BB
-    3. Reverse Candle (Red after Green)
-    """
-    if len(df) < 3:
-        return None
-    
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    touch_zone = (curr['high'] >= curr['ma5_high'] * 0.997) or \
-                 (curr['high'] >= curr['ma10_high'] * 0.997)
-    
-    valid_close = curr['close'] <= curr['bb_upper']
-    
-    is_bearish = curr['close'] < curr['open']
-    prev_bullish = prev['close'] > prev['open']
-    reverse = is_bearish and prev_bullish
-    
-    if touch_zone and valid_close and reverse:
-        return {
-            'ma5_high': curr['ma5_high'],
-            'ma10_high': curr['ma10_high'],
-            'bb_lower': curr['bb_lower'],
-            'bb_upper': curr['bb_upper'],
-            'ma5_low': curr['ma5_low'],
-            'ma10_low': curr['ma10_low'],
-            'bb_mid': curr['bb_mid']
-        }
-    return None
 
 # ==========================================
-# LEVEL CALCULATION
+# LEVEL CALCULATION (STRICT BBMA)
 # ==========================================
 def calculate_levels_buy(setup: Dict) -> Dict:
-    """BUY levels: Entry at MA5/10 Low, SL below Low BB, TP at MA5/10 High & Top BB"""
-    entry_high_risk = setup['ma5_low']
-    entry_mid_risk = (setup['ma5_low'] + setup['ma10_low']) / 2
-    entry_low_risk = setup['ma10_low']
+    """
+    BUY Levels (Oma Ally):
+    - Entry: MA5 Low (aggressive) / MA10 Low (conservative)
+    - SL: Below BB Lower (bukan percentage)
+    - TP1: MA5/10 High | TP2: BB Upper | TP3: BB Upper + buffer
+    """
+    entry_aggressive = setup['ma5_low']
+    entry_conservative = setup['ma10_low']
+    entry_moderate = (entry_aggressive + entry_conservative) / 2
     
-    sl_base = setup['bb_lower']
-    sl_high_risk = sl_base * 0.999
-    sl_mid_risk = sl_base * 0.998
-    sl_low_risk = sl_base * 0.997
+    sl = setup['bb_lower']  # SL strictly below BB Lower
     
     tp1 = setup['ma5_high']
     tp2 = setup['bb_upper']
     tp3 = setup['bb_upper'] * 1.02
     
     return {
-        'high_risk': {'entry': entry_high_risk, 'sl': sl_high_risk},
-        'mid_risk': {'entry': entry_mid_risk, 'sl': sl_mid_risk},
-        'low_risk': {'entry': entry_low_risk, 'sl': sl_low_risk},
+        'conservative': {'entry': entry_conservative, 'sl': sl},
+        'moderate': {'entry': entry_moderate, 'sl': sl},
+        'aggressive': {'entry': entry_aggressive, 'sl': sl},
         'tp1': tp1, 'tp2': tp2, 'tp3': tp3
     }
 
 def calculate_levels_sell(setup: Dict) -> Dict:
-    """SELL levels: Entry at MA5/10 High, SL above Top BB, TP at MA5/10 Low & Low BB"""
-    entry_high_risk = setup['ma5_high']
-    entry_mid_risk = (setup['ma5_high'] + setup['ma10_high']) / 2
-    entry_low_risk = setup['ma10_high']
+    """
+    SELL Levels (Oma Ally):
+    - Entry: MA5 High (aggressive) / MA10 High (conservative)
+    - SL: Above BB Upper (bukan percentage)
+    - TP1: MA5/10 Low | TP2: BB Lower | TP3: BB Lower - buffer
+    """
+    entry_aggressive = setup['ma5_high']
+    entry_conservative = setup['ma10_high']
+    entry_moderate = (entry_aggressive + entry_conservative) / 2
     
-    sl_base = setup['bb_upper']
-    sl_high_risk = sl_base * 1.001
-    sl_mid_risk = sl_base * 1.002
-    sl_low_risk = sl_base * 1.003
+    sl = setup['bb_upper']  # SL strictly above BB Upper
     
     tp1 = setup['ma5_low']
     tp2 = setup['bb_lower']
     tp3 = setup['bb_lower'] * 0.98
     
     return {
-        'high_risk': {'entry': entry_high_risk, 'sl': sl_high_risk},
-        'mid_risk': {'entry': entry_mid_risk, 'sl': sl_mid_risk},
-        'low_risk': {'entry': entry_low_risk, 'sl': sl_low_risk},
+        'conservative': {'entry': entry_conservative, 'sl': sl},
+        'moderate': {'entry': entry_moderate, 'sl': sl},
+        'aggressive': {'entry': entry_aggressive, 'sl': sl},
         'tp1': tp1, 'tp2': tp2, 'tp3': tp3
     }
 
 # ==========================================
-# SCANNER
+# SCANNER WITH STATE TRACKING
 # ==========================================
 def scan_xauusd():
+    tracker = BBMACycleTracker()
+    
     for style, tfs in STYLES.items():
         print(f"Scanning XAU/USD ({style})...")
         
@@ -270,96 +360,91 @@ def scan_xauusd():
             
             if df_big.empty or len(df_big) < 60:
                 continue
-            
             df_big = get_indicators(df_big)
             
             if df_small.empty or len(df_small) < 60:
                 continue
-            
             df_small = get_indicators(df_small)
             
-            # CHECK BUY SETUP (Uptrend)
-            if check_uptrend(df_big):
-                setup_buy = find_reentry_buy(df_small)
-                if setup_buy:
-                    levels = calculate_levels_buy(setup_buy)
-                    msg = f"""
-🟢 <b>BBMA BUY SETUP DETECTED</b>
+            # Determine trend from big TF using EMA50 vs Mid BB
+            last_big = df_big.iloc[-1]
+            uptrend = last_big['ema50'] < last_big['bb_mid']
+            downtrend = last_big['ema50'] > last_big['bb_mid']
+            
+            if not uptrend and not downtrend:
+                print(f"ℹ️ XAU/USD ({style}) - No clear trend (EMA50 near BB Mid)")
+                continue
+            
+            # Reset tracker per style/tf combination
+            tracker.reset()
+            
+            # Walk through small TF candles sequentially to track BBMA cycle
+            setup_found = None
+            for i in range(1, len(df_small)):
+                result = tracker.update(df_small.iloc[i], df_small.iloc[i-1])
+                if result is not None:
+                    setup_found = result
+                    break  # First valid setup in current cycle
+            
+            if setup_found is None:
+                print(f"ℹ️ XAU/USD ({style}) - No valid BBMA setup (cycle incomplete)")
+                continue
+            
+            # Validate setup aligns with big TF trend
+            if setup_found['type'] == 'BUY' and not uptrend:
+                print(f"ℹ️ XAU/USD ({style}) - BUY setup ignored (big TF downtrend)")
+                continue
+            if setup_found['type'] == 'SELL' and not downtrend:
+                print(f"ℹ️ XAU/USD ({style}) - SELL setup ignored (big TF uptrend)")
+                continue
+            
+            # Calculate levels and send alert
+            if setup_found['type'] == 'BUY':
+                levels = calculate_levels_buy(setup_found)
+                emoji = "🟢"
+                direction = "BUY"
+                pattern = "Bullish Re-Entry (After CSA)"
+            else:
+                levels = calculate_levels_sell(setup_found)
+                emoji = "🔴"
+                direction = "SELL"
+                pattern = "Bearish Re-Entry (After CSA)"
+            
+            msg = f"""
+{emoji} <b>BBMA {direction} SETUP DETECTED</b>
 
- Pair: XAU/USD (Gold)
+📊 Pair: XAU/USD (Gold)
 ⏱️ Style: {style}
- Pattern: Bullish Rejection (Pinbar)
+📈 Pattern: {pattern}
+✅ Cycle: Extreme → MHV → CSA → Re-Entry CONFIRMED
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🟢 <b>LOW RISK ENTRY (Konservatif)</b>
+🟢 <b>CONSERVATIVE ENTRY</b>
 Paling selamat, tunggu confirmation penuh
-• Entry: {levels['low_risk']['entry']:.2f}
-• SL: {levels['low_risk']['sl']:.2f}
+• Entry: {levels['conservative']['entry']:.2f}
+• SL: {levels['conservative']['sl']:.2f}
 • TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
-🟡 <b>MID RISK ENTRY (Moderate)</b>
+🟡 <b>MODERATE ENTRY</b>
 Balance risk & reward
-• Entry: {levels['mid_risk']['entry']:.2f}
-• SL: {levels['mid_risk']['sl']:.2f}
+• Entry: {levels['moderate']['entry']:.2f}
+• SL: {levels['moderate']['sl']:.2f}
 • TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
-🔴 <b>HIGH RISK ENTRY (Agresif)</b>
+🔴 <b>AGGRESSIVE ENTRY</b>
 Entry awal, harga terbaik, risiko tinggi
-• Entry: {levels['high_risk']['entry']:.2f}
-• SL: {levels['high_risk']['sl']:.2f}
+• Entry: {levels['aggressive']['entry']:.2f}
+• SL: {levels['aggressive']['sl']:.2f}
 • TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
 
 ━━━━━━━━━━━━━━━━━━━━
 
 ⚠️ <i>Pilih 1 level je ikut risk appetite kau! Verify live price on exchange.</i>
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
-                    """
-                    send_telegram(msg)
-                    print(f"🚨 BUY SETUP FOUND: XAU/USD ({style})")
-            
-            # CHECK SELL SETUP (Downtrend)
-            if check_downtrend(df_big):
-                setup_sell = find_reentry_sell(df_small)
-                if setup_sell:
-                    levels = calculate_levels_sell(setup_sell)
-                    msg = f"""
-🔴 <b>BBMA SELL SETUP DETECTED</b>
-
-📊 Pair: XAU/USD (Gold)
-⏱️ Style: {style}
-📉 Pattern: Bearish Rejection (Pinbar)
-
-━━━━━━━━━━━━━━━━━━━━
-
-🟢 <b>LOW RISK ENTRY (Konservatif)</b>
-Paling selamat, tunggu confirmation penuh
-• Entry: {levels['low_risk']['entry']:.2f}
-• SL: {levels['low_risk']['sl']:.2f}
-• TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
-
-🟡 <b>MID RISK ENTRY (Moderate)</b>
-Balance risk & reward
-• Entry: {levels['mid_risk']['entry']:.2f}
-• SL: {levels['mid_risk']['sl']:.2f}
-• TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
-
-🔴 <b>HIGH RISK ENTRY (Agresif)</b>
-Entry awal, harga terbaik, risiko tinggi
-• Entry: {levels['high_risk']['entry']:.2f}
-• SL: {levels['high_risk']['sl']:.2f}
-• TP1: {levels['tp1']:.2f} | TP2: {levels['tp2']:.2f} | TP3: {levels['tp3']:.2f}
-
-━━━━━━━━━━━━━━━━━━━━
-
-⚠️ <i>Pilih 1 level je ikut risk appetite kau! Verify live price on exchange.</i>
- {datetime.now().strftime('%Y-%m-%d %H:%M')}
-                    """
-                    send_telegram(msg)
-                    print(f"🚨 SELL SETUP FOUND: XAU/USD ({style})")
-            
-            if not check_uptrend(df_big) and not check_downtrend(df_big):
-                print(f"ℹ️ XAU/USD ({style}) - No clear trend (EMA50 near BB Mid)")
+            """
+            send_telegram(msg)
+            print(f"🚨 {direction} SETUP FOUND: XAU/USD ({style})")
                 
         except Exception as e:
             print(f"❌ Error XAU/USD {style}: {e}")
@@ -369,12 +454,10 @@ Entry awal, harga terbaik, risiko tinggi
 # ==========================================
 def main():
     print(f"=== BBMA XAU/USD Scan Start: {datetime.now()} ===")
-    
     try:
         scan_xauusd()
     except Exception as e:
         print(f"❌ Error scanning XAU/USD: {e}")
-    
     print("=== Scan Complete ===")
 
 if __name__ == "__main__":
