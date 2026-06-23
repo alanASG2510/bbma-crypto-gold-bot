@@ -1,5 +1,4 @@
 import os
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
@@ -16,14 +15,12 @@ TWELVEDATA_API_KEY = os.environ.get('TWELVEDATA_API_KEY')
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Missing Telegram credentials in GitHub Secrets!")
 
-# Crypto pairs use Yahoo Finance
-CRYPTO_PAIRS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'BNB-USD', 'XRP-USD', 'RENDER-USD']
-# XAU/USD use TwelveData
+# ONLY XAU/USD
 GOLD_PAIR = 'XAU/USD'
 
 STYLES = {
-    'Intraday': {'big': '4h', 'small': '1h', 'period_big': '300d', 'period_small': '300d'},
-    'Swing': {'big': '1d', 'small': '4h', 'period_big': '730d', 'period_small': '730d'}
+    'Intraday': {'big': '4h', 'small': '1h', 'period_big': 300, 'period_small': 300},
+    'Swing': {'big': '1d', 'small': '4h', 'period_big': 730, 'period_small': 730}
 }
 
 BB_PERIOD = 20
@@ -39,20 +36,19 @@ def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(window=period).apply(lwma, raw=True)
 
 def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [col.capitalize() for col in df.columns]
     df = df.copy()
     
-    df['bb_mid'] = df['Close'].rolling(BB_PERIOD).mean()
-    bb_std = df['Close'].rolling(BB_PERIOD).std()
+    df['bb_mid'] = df['close'].rolling(BB_PERIOD).mean()
+    bb_std = df['close'].rolling(BB_PERIOD).std()
     df['bb_upper'] = df['bb_mid'] + (bb_std * BB_STD)
     df['bb_lower'] = df['bb_mid'] - (bb_std * BB_STD)
     
-    df['ma5_high'] = calculate_lwma(df['High'], 5)
-    df['ma10_high'] = calculate_lwma(df['High'], 10)
-    df['ma5_low'] = calculate_lwma(df['Low'], 5)
-    df['ma10_low'] = calculate_lwma(df['Low'], 10)
+    df['ma5_high'] = calculate_lwma(df['high'], 5)
+    df['ma10_high'] = calculate_lwma(df['high'], 10)
+    df['ma5_low'] = calculate_lwma(df['low'], 5)
+    df['ma10_low'] = calculate_lwma(df['low'], 10)
     
-    df['ema50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     
     return df.dropna()
 
@@ -72,20 +68,8 @@ def send_telegram(message: str):
         print(f"❌ Failed: {e}")
 
 # ==========================================
-# DATA FETCHERS
+# DATA FETCHER - TWELVEDATA ONLY
 # ==========================================
-def fetch_yfinance_data(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    try:
-        df = yf.download(symbol, interval=interval, period=period, progress=False)
-        if df.empty or len(df) < 60:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
-    except Exception as e:
-        print(f"❌ yfinance error {symbol}: {e}")
-        return pd.DataFrame()
-
 def fetch_twelvedata_data(symbol: str, interval: str, outputsize: int = 300) -> pd.DataFrame:
     if not TWELVEDATA_API_KEY:
         print("❌ TwelveData API key not found!")
@@ -115,21 +99,31 @@ def fetch_twelvedata_data(symbol: str, interval: str, outputsize: int = 300) -> 
             print(f"❌ TwelveData error {symbol}: {data.get('message', 'No data')}")
             return pd.DataFrame()
         
+        # Convert to DataFrame
         df = pd.DataFrame(data['values'])
-        df = df.iloc[::-1]
+        df = df.iloc[::-1]  # Reverse to get chronological order
         df['datetime'] = pd.to_datetime(df['datetime'])
+        
+        # Rename columns to lowercase standard
         df = df.rename(columns={
             'datetime': 'timestamp',
-            'open': 'Open',
-            'high': 'High',
-            'low': 'Low',
-            'close': 'Close',
-            'volume': 'Volume'
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
+            'close': 'close'
         })
-        df = df[['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        
+        # Handle volume - make it optional
+        if 'volume' in df.columns:
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        else:
+            df = df[['timestamp', 'open', 'high', 'low', 'close']]
+            df['volume'] = 0  # Add dummy volume
+        
         df.set_index('timestamp', inplace=True)
         
         if len(df) < 60:
+            print(f"⚠️ Insufficient data for {symbol}: only {len(df)} candles")
             return pd.DataFrame()
         
         return df
@@ -151,13 +145,13 @@ def find_reentry_buy(df: pd.DataFrame) -> Optional[Dict]:
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
-    touch_zone = (curr['Low'] <= curr['ma5_low'] * 1.003) or \
-                 (curr['Low'] <= curr['ma10_low'] * 1.003)
+    touch_zone = (curr['low'] <= curr['ma5_low'] * 1.003) or \
+                 (curr['low'] <= curr['ma10_low'] * 1.003)
     
-    valid_close = curr['Close'] >= curr['bb_lower']
+    valid_close = curr['close'] >= curr['bb_lower']
     
-    is_bullish = curr['Close'] > curr['Open']
-    prev_bearish = prev['Close'] < prev['Open']
+    is_bullish = curr['close'] > curr['open']
+    prev_bearish = prev['close'] < prev['open']
     reverse = is_bullish and prev_bearish
     
     if touch_zone and valid_close and reverse:
@@ -193,42 +187,42 @@ def calculate_levels(setup: Dict) -> Dict:
         'tp1': tp1, 'tp2': tp2, 'tp3': tp3
     }
 
-def scan_pair(ticker: str, is_gold: bool = False):
+def scan_xauusd():
     for style, tfs in STYLES.items():
-        print(f"Scanning {ticker} ({style})...")
+        print(f"Scanning XAU/USD ({style})...")
         
         try:
-            if is_gold:
-                df_big = fetch_twelvedata_data(ticker, tfs['big'], 300)
-                df_small = fetch_twelvedata_data(ticker, tfs['small'], 300)
-            else:
-                df_big = fetch_yfinance_data(ticker, tfs['big'], tfs['period_big'])
-                df_small = fetch_yfinance_data(ticker, tfs['small'], tfs['period_small'])
+            # Fetch data from TwelveData
+            df_big = fetch_twelvedata_data(GOLD_PAIR, tfs['big'], tfs['period_big'])
+            df_small = fetch_twelvedata_data(GOLD_PAIR, tfs['small'], tfs['period_small'])
             
             if df_big.empty or len(df_big) < 60:
+                print(f"⚠️ Insufficient big TF data for XAU/USD")
                 continue
             
             df_big = get_indicators(df_big)
             
             if not check_uptrend(df_big):
+                print(f"ℹ️ XAU/USD ({style}) not in uptrend")
                 continue
             
             if df_small.empty or len(df_small) < 60:
+                print(f"⚠️ Insufficient small TF data for XAU/USD")
                 continue
             
             df_small = get_indicators(df_small)
             
             setup = find_reentry_buy(df_small)
             if not setup:
+                print(f"ℹ️ No Re-Entry Buy setup for XAU/USD ({style})")
                 continue
             
             levels = calculate_levels(setup)
-            pair_name = ticker.replace('-USD', '/USDT') if not is_gold else 'XAU/USD'
             
             msg = f"""
 🚨 <b>BBMA BUY SETUP DETECTED</b>
 
-📊 Pair: {pair_name}
+📊 Pair: XAU/USD (Gold)
 ⏱️ Style: {style}
 📈 Pattern: Bullish Rejection (Pinbar)
 
@@ -258,26 +252,20 @@ Entry awal, harga terbaik, risiko tinggi
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
             """
             send_telegram(msg)
-            print(f"🚨 SETUP FOUND: {ticker} ({style})")
+            print(f"🚨 SETUP FOUND: XAU/USD ({style})")
         except Exception as e:
-            print(f"❌ Error {ticker} {style}: {e}")
+            print(f"❌ Error XAU/USD {style}: {e}")
 
 # ==========================================
 # MAIN
 # ==========================================
 def main():
-    print(f"=== BBMA Scan Start: {datetime.now()} ===")
-    
-    for ticker in CRYPTO_PAIRS:
-        try:
-            scan_pair(ticker, is_gold=False)
-        except Exception as e:
-            print(f"❌ Error {ticker}: {e}")
+    print(f"=== BBMA XAU/USD Scan Start: {datetime.now()} ===")
     
     try:
-        scan_pair(GOLD_PAIR, is_gold=True)
+        scan_xauusd()
     except Exception as e:
-        print(f"❌ Error {GOLD_PAIR}: {e}")
+        print(f"❌ Error scanning XAU/USD: {e}")
     
     print("=== Scan Complete ===")
 
