@@ -2,7 +2,7 @@ name: BBMA Gold Alert
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # Runs every 15 minutes
+    - cron: '*/15 * * * *'  # every 15 minutes
   workflow_dispatch:
 
 jobs:
@@ -10,18 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.12'
-    
     - name: Install dependencies
       run: |
-        pip install pandas numpy requests yfinance
-    
+        pip install pandas numpy requests
     - name: Run BBMA Bot
       run: python bbma_bot.py
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
