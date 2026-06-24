@@ -1,31 +1,27 @@
-name: BBMA Gold Scanner
+name: BBMA Gold Alert
 
 on:
   schedule:
-    # Run every 2 hours
-    - cron: '0 */2 * * *'
-  workflow_dispatch:  # Allow manual run
+    - cron: '*/15 * * * *'  # Runs every 15 minutes
+  workflow_dispatch:
 
 jobs:
-  scan:
+  run:
     runs-on: ubuntu-latest
-    
     steps:
     - uses: actions/checkout@v4
     
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: '3.12'
     
     - name: Install dependencies
       run: |
-        pip install -r requirements.txt
+        pip install pandas numpy requests yfinance
     
-    - name: Run scanner
+    - name: Run BBMA Bot
+      run: python bbma_bot.py
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        GOLDAPI_KEY: ${{ secrets.GOLDAPI_KEY }}
-      run: |
-        python scanner.py
