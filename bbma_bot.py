@@ -82,28 +82,25 @@ def send_telegram(message: str):
         print(f"❌ Failed: {e}")
 
 # ==========================================
-# YAHOO FINANCE FETCHER (Primary & Only Source)
+# DATA FETCHER - XAUUSD SPOT
 # ==========================================
 def fetch_yahoo_data(interval: str) -> pd.DataFrame:
     """
-    Yahoo Finance for XAU/USD spot
-    Symbol: GC=F (Gold Futures) - most reliable free source
+    Get REAL XAUUSD spot price from Yahoo Finance
     """
     try:
         import yfinance as yf
         
-        # Gold Futures symbol on Yahoo
-        symbol = "GC=F"
+        # CORRECT: XAUUSD spot on Yahoo
+        symbol = "XAUUSD=X"
         
-        # Map BBMA intervals to Yahoo intervals
         interval_map = {
             '15m': '15m',
-            '1h': '1h', 
-            '4h': '1h'  # Yahoo doesn't have 4h, use 1h and resample
+            '1h': '1h',
+            '4h': '1h'
         }
         yf_interval = interval_map.get(interval, '1h')
         
-        # Period mapping (need enough data for 50 EMA + 20 BB)
         period_map = {
             '15m': '5d',
             '1h': '30d',
@@ -111,7 +108,7 @@ def fetch_yahoo_data(interval: str) -> pd.DataFrame:
         }
         yf_period = period_map.get(interval, '30d')
         
-        print(f"📡 Fetching {symbol} {interval} from Yahoo Finance...")
+        print(f"📡 Fetching XAUUSD spot from Yahoo...")
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=yf_period, interval=yf_interval)
         
@@ -119,10 +116,7 @@ def fetch_yahoo_data(interval: str) -> pd.DataFrame:
             print(f"❌ No data from Yahoo")
             return pd.DataFrame()
         
-        # Reset index to get datetime column
         df = df.reset_index()
-        
-        # Rename columns
         df = df.rename(columns={
             'Datetime': 'timestamp',
             'Open': 'open',
@@ -131,14 +125,11 @@ def fetch_yahoo_data(interval: str) -> pd.DataFrame:
             'Close': 'close',
             'Volume': 'volume'
         })
-        
         df.set_index('timestamp', inplace=True)
         
-        # Ensure numeric
         for col in ['open', 'high', 'low', 'close']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # Resample 1h to 4h if needed
         if interval == '4h':
             df = df.resample('4h').agg({
                 'open': 'first',
@@ -155,26 +146,19 @@ def fetch_yahoo_data(interval: str) -> pd.DataFrame:
             return pd.DataFrame()
         
         latest = df['close'].iloc[-1]
-        print(f"✅ Yahoo {interval}: {len(df)} candles, latest: {latest:.2f}")
+        print(f"✅ XAUUSD {interval}: {len(df)} candles, latest: {latest:.2f}")
         return df
         
     except Exception as e:
         print(f"❌ Yahoo error: {e}")
         return pd.DataFrame()
 
-# ==========================================
-# BACKUP: FOREX API (if Yahoo fails)
-# ==========================================
 def fetch_forex_api(interval: str) -> pd.DataFrame:
-    """Backup using forex API"""
+    """Backup using alternative source"""
     try:
-        # Alpha Vantage or similar could go here
-        # For now, try alternative Yahoo symbol
         import yfinance as yf
         
-        # Try XAUUSD spot via different route
-        symbol = "XAUUSD=X"  # Yahoo forex symbol
-        
+        symbol = "GC=F"
         yf_interval = {'15m': '15m', '1h': '1h', '4h': '1h'}.get(interval, '1h')
         yf_period = {'15m': '5d', '1h': '30d', '4h': '60d'}.get(interval, '30d')
         
@@ -216,7 +200,7 @@ def fetch_data(interval: str) -> pd.DataFrame:
     return fetch_forex_api(interval)
 
 # ==========================================
-# BBMA STATE MACHINE (Strict Oma Ally)
+# BBMA STATE MACHINE
 # ==========================================
 class BBMACycleTracker:
     def __init__(self):
@@ -249,13 +233,13 @@ class BBMACycleTracker:
         prev_bullish = prev_row['close'] > prev_row['open']
         prev_bearish = prev_row['close'] < prev_row['open']
         
-        # --- EXTREME BUY (PDF: MA5/10 Low outside BB Lower + Reverse Candle) ---
+        # --- EXTREME BUY ---
         extreme_buy = (
             (ma5_low < bb_lower or ma10_low < bb_lower) and
             is_bullish and prev_bearish
         )
         
-        # --- EXTREME SELL (PDF: MA5/10 High outside BB Upper + Reverse Candle) ---
+        # --- EXTREME SELL ---
         extreme_sell = (
             (ma5_high > bb_upper or ma10_high > bb_upper) and
             is_bearish and prev_bullish
@@ -275,8 +259,7 @@ class BBMACycleTracker:
             self.csa_confirmed = False
             return None
         
-        # --- MHV (After Extreme) ---
-        # PDF: "Price cannot close outside BB" / "Candle close dalam BB"
+        # --- MHV ---
         if self.state == BBMAState.EXTREME_BUY:
             mhv_valid = (close >= bb_lower) and is_bearish and prev_bullish
             if mhv_valid:
@@ -297,8 +280,7 @@ class BBMACycleTracker:
                 self.reset()
                 return None
         
-        # --- CSA (After MHV) ---
-        # PDF: "CS Arah - Body CS Close bawah/atas MA5/10 atau MID BB"
+        # --- CSA ---
         if self.state == BBMAState.MHV_BUY:
             csa_early = close > ma5_low and close > ma10_low
             if csa_early:
@@ -313,9 +295,7 @@ class BBMACycleTracker:
                 self.csa_confirmed = True
                 return None
         
-        # --- RE-ENTRY (Only after CSA confirmed) ---
-        # PDF: "Re-Entry - Selepas CS Arah, ada Candle Close di zone MA5/10"
-        # "Close tidak melebihi MID BB (lebih kuat)"
+        # --- RE-ENTRY ---
         if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
             in_zone = (low <= ma5_low * 1.002) or (low <= ma10_low * 1.002)
             valid_reentry = (
@@ -359,21 +339,12 @@ class BBMACycleTracker:
         return None
 
 # ==========================================
-# LEVELS (Exact Oma Ally Rules - 2 Prices Only)
+# LEVELS (Exact Oma Ally Rules)
 # ==========================================
 def calculate_levels_buy(setup: Dict) -> Dict:
-    """
-    BUY Levels (Oma Ally):
-    - Aggressive Entry: MA5 Low
-    - Conservative Entry: MA10 Low  
-    - SL: Below BB Lower
-    - TP1: MA5/10 High | TP2: BB Upper | TP3: Extended
-    """
     entry_aggressive = setup['ma5_low']
     entry_conservative = setup['ma10_low']
-    
-    # SL: Below BB Lower (PDF: "SL below BB Lower")
-    sl = setup['bb_lower'] - 0.50  # 50 cents buffer for gold
+    sl = setup['bb_lower'] - 0.50
     
     tp1 = setup['ma5_high']
     tp2 = setup['bb_upper']
@@ -387,7 +358,148 @@ def calculate_levels_buy(setup: Dict) -> Dict:
     }
 
 def calculate_levels_sell(setup: Dict) -> Dict:
-    """
-    SELL Levels (Oma Ally):
-    - Aggressive Entry: MA5 High
-    - Conservative Entry: MA
+    entry_aggressive = setup['ma5_high']
+    entry_conservative = setup['ma10_high']
+    sl = setup['bb_upper'] + 0.50
+    
+    tp1 = setup['ma5_low']
+    tp2 = setup['bb_lower']
+    tp3 = setup['bb_lower'] - (setup['bb_mid'] - setup['bb_lower']) * 0.5
+    
+    return {
+        'aggressive': {'entry': entry_aggressive, 'sl': sl},
+        'conservative': {'entry': entry_conservative, 'sl': sl},
+        'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
+        'current_price': setup['current_price']
+    }
+
+# ==========================================
+# MAIN
+# ==========================================
+def run_analysis():
+    print("\n" + "="*60)
+    print(f"🔍 BBMA Gold Analyzer - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("="*60)
+    
+    for style_name, timeframes in STYLES.items():
+        print(f"\n📊 {style_name} Analysis")
+        print("-"*40)
+        
+        big_tf = timeframes['big']
+        small_tf = timeframes['small']
+        
+        print(f"⏰ Big TF: {big_tf} | Small TF: {small_tf}")
+        
+        # Fetch data
+        df_small = fetch_data(small_tf)
+        if df_small.empty:
+            print(f"❌ No data for {small_tf}")
+            continue
+        
+        df_big = fetch_data(big_tf)
+        if df_big.empty:
+            print(f"❌ No data for {big_tf}")
+            continue
+        
+        # Calculate indicators
+        df_small = get_indicators(df_small)
+        df_big = get_indicators(df_big)
+        
+        # Latest prices
+        latest_price = df_small['close'].iloc[-1]
+        big_latest = df_big['close'].iloc[-1]
+        
+        print(f"💰 Current Price: {latest_price:.2f}")
+        print(f"💰 Big TF Price: {big_latest:.2f}")
+        
+        # Track cycles
+        tracker = BBMACycleTracker()
+        setups = []
+        
+        for i in range(20, len(df_small)):
+            if i < 1:
+                continue
+            result = tracker.update(df_small.iloc[i], df_small.iloc[i-1])
+            if result:
+                setups.append(result)
+        
+        # Find latest setup
+        if setups:
+            setup = setups[-1]
+            print(f"\n📈 Setup Found: {setup['type']}")
+            print(f"   Current Price: {setup['current_price']:.2f}")
+            
+            if setup['type'] == 'BUY':
+                levels = calculate_levels_buy(setup)
+                print("\n📊 BUY LEVELS:")
+                print(f"   AGGRESSIVE Entry: {levels['aggressive']['entry']:.2f}")
+                print(f"   CONSERVATIVE Entry: {levels['conservative']['entry']:.2f}")
+                print(f"   SL: {levels['aggressive']['sl']:.2f}")
+                print(f"   TP1: {levels['tp1']:.2f}")
+                print(f"   TP2: {levels['tp2']:.2f}")
+                print(f"   TP3: {levels['tp3']:.2f}")
+                
+                # Send to Telegram
+                msg = f"""
+📊 <b>BBMA SETUP DETECTED - {style_name}</b>
+
+Pair: XAU/USD (Gold)
+Type: {setup['type']}
+Current: {setup['current_price']:.2f}
+
+<b>🔥 AGGRESSIVE ENTRY</b>
+Entry: {levels['aggressive']['entry']:.2f}
+SL: {levels['aggressive']['sl']:.2f}
+
+<b>🛡️ CONSERVATIVE ENTRY</b>
+Entry: {levels['conservative']['entry']:.2f}
+SL: {levels['conservative']['sl']:.2f}
+
+<b>🎯 TAKE PROFITS</b>
+TP1: {levels['tp1']:.2f}
+TP2: {levels['tp2']:.2f}
+TP3: {levels['tp3']:.2f}
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
+                """
+                send_telegram(msg)
+                
+            elif setup['type'] == 'SELL':
+                levels = calculate_levels_sell(setup)
+                print("\n📊 SELL LEVELS:")
+                print(f"   AGGRESSIVE Entry: {levels['aggressive']['entry']:.2f}")
+                print(f"   CONSERVATIVE Entry: {levels['conservative']['entry']:.2f}")
+                print(f"   SL: {levels['aggressive']['sl']:.2f}")
+                print(f"   TP1: {levels['tp1']:.2f}")
+                print(f"   TP2: {levels['tp2']:.2f}")
+                print(f"   TP3: {levels['tp3']:.2f}")
+                
+                msg = f"""
+📊 <b>BBMA SETUP DETECTED - {style_name}</b>
+
+Pair: XAU/USD (Gold)
+Type: {setup['type']}
+Current: {setup['current_price']:.2f}
+
+<b>🔥 AGGRESSIVE ENTRY</b>
+Entry: {levels['aggressive']['entry']:.2f}
+SL: {levels['aggressive']['sl']:.2f}
+
+<b>🛡️ CONSERVATIVE ENTRY</b>
+Entry: {levels['conservative']['entry']:.2f}
+SL: {levels['conservative']['sl']:.2f}
+
+<b>🎯 TAKE PROFITS</b>
+TP1: {levels['tp1']:.2f}
+TP2: {levels['tp2']:.2f}
+TP3: {levels['tp3']:.2f}
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
+                """
+                send_telegram(msg)
+        else:
+            print("   No setup found")
+            print(f"   Current state: {tracker.state}")
+
+if __name__ == "__main__":
+    run_analysis()
