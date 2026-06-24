@@ -2,11 +2,11 @@ import os
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Optional
 from enum import Enum
 import json
-import time
+import sys
 
 # ==========================================
 # CONFIGURATION
@@ -18,7 +18,7 @@ ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY')
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Missing Telegram credentials!")
 if not ALPHA_VANTAGE_KEY:
-    raise ValueError("Missing Alpha Vantage API key!")
+    raise ValueError("Missing ALPHA_VANTAGE_KEY secret!")
 
 GOLD_PAIR = 'XAUUSD'
 BB_PERIOD = 20
@@ -81,7 +81,7 @@ def send_telegram(message: str):
         print(f"❌ Failed: {e}")
 
 # ==========================================
-# DATA FETCHER – ALPHA VANTAGE ONLY
+# DATA FETCHER – ALPHA VANTAGE ONLY (with debug)
 # ==========================================
 def fetch_alpha_vantage(interval: str) -> pd.DataFrame:
     interval_map = {'15m': '15min', '1h': '60min', '4h': '60min'}
@@ -92,17 +92,33 @@ def fetch_alpha_vantage(interval: str) -> pd.DataFrame:
         'interval': interval_map[interval],
         'apikey': ALPHA_VANTAGE_KEY,
         'datatype': 'json',
-        'outputsize': 'full'  # gets up to 100,000 data points
+        'outputsize': 'full'  # gets lots of data
     }
     url = 'https://www.alphavantage.co/query'
     print(f"📡 Fetching XAUUSD spot from Alpha Vantage ({interval})...")
     try:
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
+        
+        # DEBUG: print first 200 chars of response to see errors
+        print(f"🔍 API Response (first 200 chars): {json.dumps(data)[:200]}")
+
+        # Check for common errors
+        if 'Error Message' in data:
+            print(f"❌ Alpha Vantage error: {data['Error Message']}")
+            return pd.DataFrame()
+        if 'Note' in data:
+            print(f"⚠️ Alpha Vantage note: {data['Note']}")
+            return pd.DataFrame()
+        if 'Information' in data:
+            print(f"ℹ️ Alpha Vantage info: {data['Information']}")
+            return pd.DataFrame()
+
         key = f"Time Series FX ({interval_map[interval]})"
         if key not in data:
-            print(f"❌ Alpha Vantage: no data for {interval}")
+            print(f"❌ Alpha Vantage: no data for {interval}. Response keys: {list(data.keys())}")
             return pd.DataFrame()
+
         rows = []
         for dt_str, values in data[key].items():
             rows.append({
@@ -115,7 +131,7 @@ def fetch_alpha_vantage(interval: str) -> pd.DataFrame:
         df = pd.DataFrame(rows)
         df.set_index('timestamp', inplace=True)
         df = df.sort_index()
-        # Resample 4h if needed (Alpha Vantage only gives 15min or 60min)
+        # Resample 4h if needed
         if interval == '4h':
             df = df.resample('4h').agg({
                 'open': 'first',
@@ -131,7 +147,7 @@ def fetch_alpha_vantage(interval: str) -> pd.DataFrame:
         print(f"✅ Alpha Vantage {interval}: {len(df)} candles, latest: {latest:.2f}")
         return df[['open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
-        print(f"❌ Alpha Vantage error: {e}")
+        print(f"❌ Alpha Vantage exception: {e}")
         return pd.DataFrame()
 
 def fetch_data(interval: str) -> pd.DataFrame:
@@ -174,7 +190,6 @@ class BBMACycleTracker:
         prev_bearish = prev_row['close'] < prev_row['open']
 
         # --- EXTREME ---
-        # PDF: MA5/10 outside BB + reverse candle
         if (ma5_low < bb_lower or ma10_low < bb_lower) and is_bullish and prev_bearish:
             self.state = BBMAState.EXTREME_BUY
             self.extreme_price = low
@@ -189,7 +204,6 @@ class BBMACycleTracker:
             return None
 
         # --- MHV ---
-        # PDF: after extreme, price cannot close outside BB, reverse candle
         if self.state == BBMAState.EXTREME_BUY:
             if close < bb_lower:
                 self.reset()
@@ -207,8 +221,7 @@ class BBMACycleTracker:
                 self.mhv_price = low
                 return None
 
-        # --- CSA (Candle Stick Arah) ---
-        # PDF: close below/above MA5/10 (or mid BB for stronger)
+        # --- CSA ---
         if self.state == BBMAState.MHV_BUY:
             if close > ma5_low and close > ma10_low:
                 self.state = BBMAState.CSA_BUY
@@ -221,7 +234,6 @@ class BBMACycleTracker:
                 return None
 
         # --- RE-ENTRY ---
-        # PDF: after CSA, candle close in MA5/10 zone, not exceeding mid BB
         if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
             in_zone = (low <= ma5_low * 1.002) or (low <= ma10_low * 1.002)
             if in_zone and is_bullish and prev_bearish and close <= ma5_high and close <= ma10_high and close <= bb_mid:
@@ -304,10 +316,8 @@ def is_duplicate(setup: Dict) -> bool:
     last = get_last_alert()
     if not last:
         return False
-    # Compare type and timestamp (only alert if same setup within last 4 hours)
     if last['type'] != setup['type']:
         return False
-    # Check if timestamp is within 4 hours
     last_time = pd.to_datetime(last['timestamp'])
     this_time = setup['timestamp']
     if abs((this_time - last_time).total_seconds()) < 14400:  # 4 hours
@@ -346,7 +356,6 @@ def run_analysis():
         print(f"💰 Current Price (small): {latest_price:.2f}")
         print(f"💰 Current Price (big):   {big_latest:.2f}")
 
-        # Track cycles
         tracker = BBMACycleTracker()
         setups = []
         for i in range(20, len(df_small)):
@@ -358,16 +367,13 @@ def run_analysis():
             print("   No setup found")
             continue
 
-        # Use the latest setup
         setup = setups[-1]
         print(f"\n📈 Latest Setup: {setup['type']} at {setup['current_price']:.2f}")
 
-        # Check if duplicate
         if is_duplicate(setup):
             print("   ⏳ Skipping duplicate alert (same setup already sent)")
             continue
 
-        # Build message
         if setup['type'] == 'BUY':
             levels = calculate_levels_buy(setup)
             msg = f"""
@@ -392,7 +398,7 @@ TP3: {levels['tp3']:.2f}
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
 """
-        else:  # SELL
+        else:
             levels = calculate_levels_sell(setup)
             msg = f"""
 📊 <b>BBMA SETUP DETECTED - {style_name}</b>
