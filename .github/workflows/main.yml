@@ -1,9 +1,9 @@
-name: BBMA Gold Alert
+name: BBMA FCPO Alert
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # every 15 minutes
-  workflow_dispatch:
+    - cron: '0 * * * *'   # Setiap jam pada minit ke-0 (cth: 1:00 PM, 2:00 PM, 3:00 PM)
+  workflow_dispatch:      # Benarkan run manual bila-bila masa
 
 jobs:
   run:
@@ -15,11 +15,9 @@ jobs:
       with:
         python-version: '3.12'
     - name: Install dependencies
-      run: |
-        pip install pandas numpy requests
+      run: pip install pandas numpy requests yfinance
     - name: Run BBMA Bot
       run: python bbma_bot.py
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
