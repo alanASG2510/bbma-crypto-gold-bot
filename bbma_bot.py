@@ -9,7 +9,7 @@ import json
 import time
 
 # ==========================================
-# CONFIGURATION
+# KONFIGURASI
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
@@ -17,13 +17,13 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Missing Telegram credentials!")
 
-# Tukar kepada FCPO
+# --- Tukar kepada FCPO ---
 SYMBOL = 'FCPOc1'   # Bursa Malaysia Crude Palm Oil Futures
-# SYMBOL = 'FCPO=F' # backup jika FCPOc1 tak jalan
 
 BB_PERIOD = 20
 BB_STD = 2.0
 
+# HANYA 2 STYLE: Intraday & Swing (seperti yang diminta)
 STYLES = {
     'Intraday': {'big': '1h', 'small': '15m'},
     'Swing': {'big': '4h', 'small': '1h'},
@@ -43,7 +43,7 @@ class BBMAState(Enum):
     REENTRY_SELL = 8
 
 # ==========================================
-# INDICATORS
+# INDIKATOR (LWMA 5/10, BB 20,2)
 # ==========================================
 def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
     weights = np.arange(1, period + 1)
@@ -80,7 +80,7 @@ def send_telegram(message: str):
         print(f"❌ Failed: {e}")
 
 # ==========================================
-# DATA FETCHER – YAHOO FINANCE UNTUK FCPO
+# DATA FETCHER (YAHOO FINANCE UNTUK FCPO)
 # ==========================================
 def fetch_yahoo_data(interval: str) -> pd.DataFrame:
     import yfinance as yf
@@ -112,7 +112,7 @@ def fetch_yahoo_data(interval: str) -> pd.DataFrame:
             }).dropna()
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
         if len(df) < 60:
-            print(f"❌ Yahoo: only {len(df)} candles")
+            print(f"❌ Yahoo: only {len(df)} candles (perlu ≥60)")
             return pd.DataFrame()
         latest = df['close'].iloc[-1]
         print(f"✅ Yahoo {interval}: {len(df)} candles, latest: {latest:.2f}")
@@ -125,7 +125,7 @@ def fetch_data(interval: str) -> pd.DataFrame:
     return fetch_yahoo_data(interval)
 
 # ==========================================
-# BBMA STATE MACHINE (sama macam sebelum ni)
+# MESIN BBMA (Extreme > MHV > CSA > Re-Entry)
 # ==========================================
 class BBMACycleTracker:
     def __init__(self):
@@ -235,7 +235,7 @@ class BBMACycleTracker:
         return None
 
 # ==========================================
-# LEVELS
+# LEVEL (Entry, SL, TP)
 # ==========================================
 def calculate_levels_buy(setup: Dict) -> Dict:
     entry_agg = setup['ma5_low']
@@ -266,7 +266,7 @@ def calculate_levels_sell(setup: Dict) -> Dict:
     }
 
 # ==========================================
-# ALERT HISTORY (cegah duplicate)
+# CEK DUPLIKAT (elak spam)
 # ==========================================
 def get_last_alert() -> Optional[Dict]:
     if os.path.exists(ALERT_HISTORY_FILE):
@@ -295,7 +295,7 @@ def is_duplicate(setup: Dict) -> bool:
     return False
 
 # ==========================================
-# MAIN
+# FUNGSI UTAMA
 # ==========================================
 def run_analysis():
     print("\n" + "="*60)
