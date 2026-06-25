@@ -1,23 +1,27 @@
-name: BBMA FCPO Alert
+name: BBMA FCPO Alert (iTick)
 
 on:
   schedule:
-    - cron: '0 * * * *'   # Setiap jam pada minit ke-0 (cth: 1:00 PM, 2:00 PM, 3:00 PM)
-  workflow_dispatch:      # Benarkan run manual bila-bila masa
+    - cron: '0 * * * *'      # Setiap jam pada minit ke-0
+  workflow_dispatch:         # Benarkan run manual
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.12'
+    
     - name: Install dependencies
-      run: pip install pandas numpy requests yfinance
+      run: pip install pandas numpy requests
+    
     - name: Run BBMA Bot
       run: python bbma_bot.py
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        ITICK_API_TOKEN: ${{ secrets.ITICK_API_TOKEN }}
