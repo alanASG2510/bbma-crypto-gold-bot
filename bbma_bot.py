@@ -6,30 +6,29 @@ from datetime import datetime
 from typing import Dict, Optional
 from enum import Enum
 import json
-import sys
+import time
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY')
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Missing Telegram credentials!")
-if not ALPHA_VANTAGE_KEY:
-    raise ValueError("Missing ALPHA_VANTAGE_KEY secret!")
 
-GOLD_PAIR = 'XAUUSD'
+# Tukar kepada FCPO
+SYMBOL = 'FCPOc1'   # Bursa Malaysia Crude Palm Oil Futures
+# SYMBOL = 'FCPO=F' # backup jika FCPOc1 tak jalan
+
 BB_PERIOD = 20
 BB_STD = 2.0
 
 STYLES = {
     'Intraday': {'big': '1h', 'small': '15m'},
-    'Swing': {'big': '4h', 'small': '1h'}
+    'Swing': {'big': '4h', 'small': '1h'},
 }
 
-# File to store last alert info (prevents duplicates)
 ALERT_HISTORY_FILE = 'last_alert.json'
 
 class BBMAState(Enum):
@@ -44,7 +43,7 @@ class BBMAState(Enum):
     REENTRY_SELL = 8
 
 # ==========================================
-# INDICATORS (exact Oma Ally)
+# INDICATORS
 # ==========================================
 def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
     weights = np.arange(1, period + 1)
@@ -81,81 +80,52 @@ def send_telegram(message: str):
         print(f"❌ Failed: {e}")
 
 # ==========================================
-# DATA FETCHER – ALPHA VANTAGE ONLY (with debug)
+# DATA FETCHER – YAHOO FINANCE UNTUK FCPO
 # ==========================================
-def fetch_alpha_vantage(interval: str) -> pd.DataFrame:
-    interval_map = {'15m': '15min', '1h': '60min', '4h': '60min'}
-    params = {
-        'function': 'FX_INTRADAY',
-        'from_symbol': 'XAU',
-        'to_symbol': 'USD',
-        'interval': interval_map[interval],
-        'apikey': ALPHA_VANTAGE_KEY,
-        'datatype': 'json',
-        'outputsize': 'full'  # gets lots of data
-    }
-    url = 'https://www.alphavantage.co/query'
-    print(f"📡 Fetching XAUUSD spot from Alpha Vantage ({interval})...")
+def fetch_yahoo_data(interval: str) -> pd.DataFrame:
+    import yfinance as yf
+    interval_map = {'15m': '15m', '1h': '1h', '4h': '1h'}
+    period_map = {'15m': '5d', '1h': '30d', '4h': '60d'}
+    yf_interval = interval_map.get(interval, '1h')
+    yf_period = period_map.get(interval, '30d')
+    
+    print(f"📡 Fetching {SYMBOL} ({interval}) from Yahoo Finance...")
     try:
-        resp = requests.get(url, params=params, timeout=15)
-        data = resp.json()
-        
-        # DEBUG: print first 200 chars of response to see errors
-        print(f"🔍 API Response (first 200 chars): {json.dumps(data)[:200]}")
-
-        # Check for common errors
-        if 'Error Message' in data:
-            print(f"❌ Alpha Vantage error: {data['Error Message']}")
+        ticker = yf.Ticker(SYMBOL)
+        df = ticker.history(period=yf_period, interval=yf_interval)
+        if df.empty:
+            print(f"❌ Yahoo: no data for {SYMBOL}")
             return pd.DataFrame()
-        if 'Note' in data:
-            print(f"⚠️ Alpha Vantage note: {data['Note']}")
-            return pd.DataFrame()
-        if 'Information' in data:
-            print(f"ℹ️ Alpha Vantage info: {data['Information']}")
-            return pd.DataFrame()
-
-        key = f"Time Series FX ({interval_map[interval]})"
-        if key not in data:
-            print(f"❌ Alpha Vantage: no data for {interval}. Response keys: {list(data.keys())}")
-            return pd.DataFrame()
-
-        rows = []
-        for dt_str, values in data[key].items():
-            rows.append({
-                'timestamp': pd.to_datetime(dt_str),
-                'open': float(values['1. open']),
-                'high': float(values['2. high']),
-                'low': float(values['3. low']),
-                'close': float(values['4. close']),
-            })
-        df = pd.DataFrame(rows)
+        df = df.reset_index()
+        df = df.rename(columns={
+            'Datetime': 'timestamp',
+            'Open': 'open', 'High': 'high',
+            'Low': 'low', 'Close': 'close',
+            'Volume': 'volume'
+        })
         df.set_index('timestamp', inplace=True)
-        df = df.sort_index()
-        # Resample 4h if needed
         if interval == '4h':
             df = df.resample('4h').agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last'
+                'open': 'first', 'high': 'max',
+                'low': 'min', 'close': 'last',
+                'volume': 'sum'
             }).dropna()
-        df['volume'] = 0
+        df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
         if len(df) < 60:
-            print(f"❌ Alpha Vantage: only {len(df)} candles (need at least 60)")
+            print(f"❌ Yahoo: only {len(df)} candles")
             return pd.DataFrame()
         latest = df['close'].iloc[-1]
-        print(f"✅ Alpha Vantage {interval}: {len(df)} candles, latest: {latest:.2f}")
-        return df[['open', 'high', 'low', 'close', 'volume']]
+        print(f"✅ Yahoo {interval}: {len(df)} candles, latest: {latest:.2f}")
+        return df
     except Exception as e:
-        print(f"❌ Alpha Vantage exception: {e}")
+        print(f"❌ Yahoo error: {e}")
         return pd.DataFrame()
 
 def fetch_data(interval: str) -> pd.DataFrame:
-    """Only Alpha Vantage"""
-    return fetch_alpha_vantage(interval)
+    return fetch_yahoo_data(interval)
 
 # ==========================================
-# BBMA STATE MACHINE (exact Oma Ally)
+# BBMA STATE MACHINE (sama macam sebelum ni)
 # ==========================================
 class BBMACycleTracker:
     def __init__(self):
@@ -265,7 +235,7 @@ class BBMACycleTracker:
         return None
 
 # ==========================================
-# LEVELS (Oma Ally rules)
+# LEVELS
 # ==========================================
 def calculate_levels_buy(setup: Dict) -> Dict:
     entry_agg = setup['ma5_low']
@@ -296,7 +266,7 @@ def calculate_levels_sell(setup: Dict) -> Dict:
     }
 
 # ==========================================
-# ALERT HISTORY (prevent duplicates)
+# ALERT HISTORY (cegah duplicate)
 # ==========================================
 def get_last_alert() -> Optional[Dict]:
     if os.path.exists(ALERT_HISTORY_FILE):
@@ -320,7 +290,7 @@ def is_duplicate(setup: Dict) -> bool:
         return False
     last_time = pd.to_datetime(last['timestamp'])
     this_time = setup['timestamp']
-    if abs((this_time - last_time).total_seconds()) < 14400:  # 4 hours
+    if abs((this_time - last_time).total_seconds()) < 14400:  # 4 jam
         return True
     return False
 
@@ -329,7 +299,7 @@ def is_duplicate(setup: Dict) -> bool:
 # ==========================================
 def run_analysis():
     print("\n" + "="*60)
-    print(f"🔍 BBMA Gold Analyzer - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"🔍 BBMA FCPO Analyzer - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("="*60)
 
     for style_name, timeframes in STYLES.items():
@@ -379,7 +349,7 @@ def run_analysis():
             msg = f"""
 📊 <b>BBMA SETUP DETECTED - {style_name}</b>
 
-Pair: XAU/USD (Gold)
+Pair: FCPO (Crude Palm Oil Futures)
 Type: BUY
 Current: {setup['current_price']:.2f}
 
@@ -403,7 +373,7 @@ TP3: {levels['tp3']:.2f}
             msg = f"""
 📊 <b>BBMA SETUP DETECTED - {style_name}</b>
 
-Pair: XAU/USD (Gold)
+Pair: FCPO (Crude Palm Oil Futures)
 Type: SELL
 Current: {setup['current_price']:.2f}
 
