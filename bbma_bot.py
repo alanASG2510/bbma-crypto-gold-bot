@@ -9,26 +9,33 @@ import json
 import time
 
 # ==========================================
-# KONFIGURASI
+# 1. KONFIGURASI
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+ITICK_API_TOKEN = os.environ.get('ITICK_API_TOKEN')
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Missing Telegram credentials!")
+if not ITICK_API_TOKEN:
+    raise ValueError("Missing iTick API token!")
 
-# --- Tukar kepada FCPO ---
-SYMBOL = 'FCPOc1'   # Bursa Malaysia Crude Palm Oil Futures
+# Konfigurasi iTick
+ITICK_BASE_URL = "https://api.itick.org"
+REGION = "MY"
+SYMBOL_CODE = "FCPO"
 
+# Parameter BBMA
 BB_PERIOD = 20
 BB_STD = 2.0
 
-# HANYA 2 STYLE: Intraday & Swing (seperti yang diminta)
+# Hanya 2 Style: Intraday & Swing
 STYLES = {
     'Intraday': {'big': '1h', 'small': '15m'},
     'Swing': {'big': '4h', 'small': '1h'},
 }
 
+# File untuk simpan alert terakhir (cegah spam)
 ALERT_HISTORY_FILE = 'last_alert.json'
 
 class BBMAState(Enum):
@@ -43,7 +50,7 @@ class BBMAState(Enum):
     REENTRY_SELL = 8
 
 # ==========================================
-# INDIKATOR (LWMA 5/10, BB 20,2)
+# 2. INDIKATOR (LWMA 5/10, BB 20/2, EMA50)
 # ==========================================
 def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
     weights = np.arange(1, period + 1)
@@ -53,19 +60,22 @@ def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
 
 def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # Bollinger Bands
     df['bb_mid'] = df['close'].rolling(BB_PERIOD).mean()
     bb_std = df['close'].rolling(BB_PERIOD).std()
     df['bb_upper'] = df['bb_mid'] + (bb_std * BB_STD)
     df['bb_lower'] = df['bb_mid'] - (bb_std * BB_STD)
+    # LWMA High/Low
     df['ma5_high'] = calculate_lwma(df['high'], 5)
     df['ma10_high'] = calculate_lwma(df['high'], 10)
     df['ma5_low'] = calculate_lwma(df['low'], 5)
     df['ma10_low'] = calculate_lwma(df['low'], 10)
+    # EMA 50
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     return df.dropna()
 
 # ==========================================
-# TELEGRAM
+# 3. TELEGRAM
 # ==========================================
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -80,52 +90,76 @@ def send_telegram(message: str):
         print(f"❌ Failed: {e}")
 
 # ==========================================
-# DATA FETCHER (YAHOO FINANCE UNTUK FCPO)
+# 4. DATA FETCHER – iTICK
 # ==========================================
-def fetch_yahoo_data(interval: str) -> pd.DataFrame:
-    import yfinance as yf
-    interval_map = {'15m': '15m', '1h': '1h', '4h': '1h'}
-    period_map = {'15m': '5d', '1h': '30d', '4h': '60d'}
-    yf_interval = interval_map.get(interval, '1h')
-    yf_period = period_map.get(interval, '30d')
+def fetch_itick_data(interval: str, count: int = 200) -> pd.DataFrame:
+    # Map interval ke format iTick
+    interval_map = {
+        '15m': '15m',
+        '1h': '1h',
+        '4h': '4h'
+    }
+    if interval not in interval_map:
+        print(f"❌ Unsupported interval: {interval}")
+        return pd.DataFrame()
     
-    print(f"📡 Fetching {SYMBOL} ({interval}) from Yahoo Finance...")
+    kline_type = interval_map[interval]
+    url = f"{ITICK_BASE_URL}/future/kline"
+    params = {
+        "region": REGION,
+        "code": SYMBOL_CODE,
+        "kline_type": kline_type,
+        "size": count
+    }
+    headers = {"token": ITICK_API_TOKEN}
+    
+    print(f"📡 Fetching {SYMBOL_CODE} ({interval}) from iTick...")
     try:
-        ticker = yf.Ticker(SYMBOL)
-        df = ticker.history(period=yf_period, interval=yf_interval)
-        if df.empty:
-            print(f"❌ Yahoo: no data for {SYMBOL}")
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        data = resp.json()
+        
+        # Debug ringkas
+        if data.get("code") != 0:
+            print(f"❌ iTick error: {data.get('msg', 'Unknown error')}")
             return pd.DataFrame()
-        df = df.reset_index()
-        df = df.rename(columns={
-            'Datetime': 'timestamp',
-            'Open': 'open', 'High': 'high',
-            'Low': 'low', 'Close': 'close',
-            'Volume': 'volume'
-        })
+        
+        if "data" not in data or not data["data"]:
+            print(f"❌ iTick: No data returned")
+            return pd.DataFrame()
+        
+        rows = []
+        for item in data["data"]:
+            # Pastikan semua key ada
+            rows.append({
+                'timestamp': pd.to_datetime(item['t']),
+                'open': float(item['o']),
+                'high': float(item['h']),
+                'low': float(item['l']),
+                'close': float(item['c']),
+                'volume': float(item.get('v', 0))
+            })
+        
+        df = pd.DataFrame(rows)
         df.set_index('timestamp', inplace=True)
-        if interval == '4h':
-            df = df.resample('4h').agg({
-                'open': 'first', 'high': 'max',
-                'low': 'min', 'close': 'last',
-                'volume': 'sum'
-            }).dropna()
-        df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
+        df = df.sort_index()
+        
         if len(df) < 60:
-            print(f"❌ Yahoo: only {len(df)} candles (perlu ≥60)")
+            print(f"❌ iTick: only {len(df)} candles (need ≥60)")
             return pd.DataFrame()
+        
         latest = df['close'].iloc[-1]
-        print(f"✅ Yahoo {interval}: {len(df)} candles, latest: {latest:.2f}")
-        return df
+        print(f"✅ iTick {interval}: {len(df)} candles, latest: {latest:.2f}")
+        return df[['open', 'high', 'low', 'close', 'volume']]
+        
     except Exception as e:
-        print(f"❌ Yahoo error: {e}")
+        print(f"❌ iTick exception: {e}")
         return pd.DataFrame()
 
 def fetch_data(interval: str) -> pd.DataFrame:
-    return fetch_yahoo_data(interval)
+    return fetch_itick_data(interval)
 
 # ==========================================
-# MESIN BBMA (Extreme > MHV > CSA > Re-Entry)
+# 5. MESIN BBMA (EXTREME → MHV → CSA → RE-ENTRY)
 # ==========================================
 class BBMACycleTracker:
     def __init__(self):
@@ -159,13 +193,15 @@ class BBMACycleTracker:
         prev_bullish = prev_row['close'] > prev_row['open']
         prev_bearish = prev_row['close'] < prev_row['open']
 
-        # --- EXTREME ---
+        # --- EXTREME BUY (MA5/10 Low keluar BB Lower + Reverse Candle) ---
         if (ma5_low < bb_lower or ma10_low < bb_lower) and is_bullish and prev_bearish:
             self.state = BBMAState.EXTREME_BUY
             self.extreme_price = low
             self.mhv_price = None
             self.csa_confirmed = False
             return None
+        
+        # --- EXTREME SELL (MA5/10 High keluar BB Upper + Reverse Candle) ---
         if (ma5_high > bb_upper or ma10_high > bb_upper) and is_bearish and prev_bullish:
             self.state = BBMAState.EXTREME_SELL
             self.extreme_price = high
@@ -173,7 +209,7 @@ class BBMACycleTracker:
             self.csa_confirmed = False
             return None
 
-        # --- MHV ---
+        # --- MHV (Selepas Extreme, Candle takleh close luar BB) ---
         if self.state == BBMAState.EXTREME_BUY:
             if close < bb_lower:
                 self.reset()
@@ -191,7 +227,7 @@ class BBMACycleTracker:
                 self.mhv_price = low
                 return None
 
-        # --- CSA ---
+        # --- CSA (Candle Stick Arah) ---
         if self.state == BBMAState.MHV_BUY:
             if close > ma5_low and close > ma10_low:
                 self.state = BBMAState.CSA_BUY
@@ -203,7 +239,7 @@ class BBMACycleTracker:
                 self.csa_confirmed = True
                 return None
 
-        # --- RE-ENTRY ---
+        # --- RE-ENTRY (Selepas CSA, di Zone MA5/10) ---
         if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
             in_zone = (low <= ma5_low * 1.002) or (low <= ma10_low * 1.002)
             if in_zone and is_bullish and prev_bearish and close <= ma5_high and close <= ma10_high and close <= bb_mid:
@@ -235,12 +271,12 @@ class BBMACycleTracker:
         return None
 
 # ==========================================
-# LEVEL (Entry, SL, TP)
+# 6. LEVEL ENTRY, SL, TP
 # ==========================================
 def calculate_levels_buy(setup: Dict) -> Dict:
     entry_agg = setup['ma5_low']
     entry_con = setup['ma10_low']
-    sl = setup['bb_lower'] - 0.50
+    sl = setup['bb_lower'] - 0.50  # Buffer kecil
     tp1 = setup['ma5_high']
     tp2 = setup['bb_upper']
     tp3 = setup['bb_upper'] + (setup['bb_upper'] - setup['bb_mid']) * 0.5
@@ -266,7 +302,7 @@ def calculate_levels_sell(setup: Dict) -> Dict:
     }
 
 # ==========================================
-# CEK DUPLIKAT (elak spam)
+# 7. CEK DUPLIKAT (ELAK SPAM)
 # ==========================================
 def get_last_alert() -> Optional[Dict]:
     if os.path.exists(ALERT_HISTORY_FILE):
@@ -290,16 +326,17 @@ def is_duplicate(setup: Dict) -> bool:
         return False
     last_time = pd.to_datetime(last['timestamp'])
     this_time = setup['timestamp']
-    if abs((this_time - last_time).total_seconds()) < 14400:  # 4 jam
+    # Jika setup sama dalam tempoh 4 jam, skip
+    if abs((this_time - last_time).total_seconds()) < 14400:
         return True
     return False
 
 # ==========================================
-# FUNGSI UTAMA
+# 8. FUNGSI UTAMA
 # ==========================================
 def run_analysis():
     print("\n" + "="*60)
-    print(f"🔍 BBMA FCPO Analyzer - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"🔍 BBMA FCPO Analyzer (iTick) - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("="*60)
 
     for style_name, timeframes in STYLES.items():
@@ -309,6 +346,7 @@ def run_analysis():
         small_tf = timeframes['small']
         print(f"⏰ Big TF: {big_tf} | Small TF: {small_tf}")
 
+        # Ambil data untuk kedua-dua TF
         df_small = fetch_data(small_tf)
         if df_small.empty:
             print(f"❌ No data for {small_tf}")
@@ -318,6 +356,7 @@ def run_analysis():
             print(f"❌ No data for {big_tf}")
             continue
 
+        # Kira indikator
         df_small = get_indicators(df_small)
         df_big = get_indicators(df_big)
 
@@ -326,6 +365,7 @@ def run_analysis():
         print(f"💰 Current Price (small): {latest_price:.2f}")
         print(f"💰 Current Price (big):   {big_latest:.2f}")
 
+        # Track setup
         tracker = BBMACycleTracker()
         setups = []
         for i in range(20, len(df_small)):
@@ -344,6 +384,7 @@ def run_analysis():
             print("   ⏳ Skipping duplicate alert (same setup already sent)")
             continue
 
+        # Bina mesej
         if setup['type'] == 'BUY':
             levels = calculate_levels_buy(setup)
             msg = f"""
@@ -368,7 +409,7 @@ TP3: {levels['tp3']:.2f}
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
 """
-        else:
+        else:  # SELL
             levels = calculate_levels_sell(setup)
             msg = f"""
 📊 <b>BBMA SETUP DETECTED - {style_name}</b>
@@ -392,6 +433,7 @@ TP3: {levels['tp3']:.2f}
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
 """
+
         send_telegram(msg)
         save_last_alert(setup)
         print("✅ Alert sent and saved")
