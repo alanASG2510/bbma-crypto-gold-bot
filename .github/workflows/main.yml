@@ -26,7 +26,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install yfinance pandas numpy requests
+        pip install -r requirements.txt
 
     - name: Ensure alert cache exists
       run: |
@@ -39,7 +39,7 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         ALERT_CACHE_PATH: alert_cache.json
-      run: python bbma_scanner.py
+      run: python bbma_bot.py
 
     - name: Save alert cache
       run: |
