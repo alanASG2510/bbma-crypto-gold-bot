@@ -1,442 +1,830 @@
+"""
+BBMA Crypto Spot Scanner — RENDER-USD ONLY
+===========================================
+BUY ONLY | Spot Trading | Intraday + Swing
+
+✅ FOCUSED: Only scans RENDER-USD
+✅ LIQUIDITY: Lowered to $1M to avoid Yahoo volume gaps
+✅ BTC FILTER: Disabled (info only)
+✅ 15m data capped to 59 days
+"""
+
 import os
+import json
+import time
+import traceback
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime
-from typing import Dict, Optional
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 from enum import Enum
-import json
-import time
+from dataclasses import dataclass, field
 
-# ==========================================
-# 1. KONFIGURASI
-# ==========================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-ITICK_API_TOKEN = os.environ.get('ITICK_API_TOKEN')
+TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID')
+DRY_RUN            = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+COINGLASS_API_KEY  = os.environ.get('COINGLASS_API_KEY')
+ALERT_CACHE_PATH   = os.environ.get('ALERT_CACHE_PATH', 'alert_cache.json')
 
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+if not DRY_RUN and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
     raise ValueError("Missing Telegram credentials!")
-if not ITICK_API_TOKEN:
-    raise ValueError("Missing iTick API token!")
 
-# Konfigurasi iTick
-ITICK_BASE_URL = "https://api.itick.org"
-REGION = "MY"
-SYMBOL_CODE = "FCPO"
-
-# Parameter BBMA
-BB_PERIOD = 20
-BB_STD = 2.0
-
-# Hanya 2 Style: Intraday & Swing
-STYLES = {
-    'Intraday': {'big': '1h', 'small': '15m'},
-    'Swing': {'big': '4h', 'small': '1h'},
+# ── PER-PAIR CONFIG (HANYA RENDER) ────────────────────────────
+PAIRS: Dict[str, Dict] = {
+    'RENDER-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},
 }
 
-# File untuk simpan alert terakhir (cegah spam)
-ALERT_HISTORY_FILE = 'last_alert.json'
+# ── 3-TIMEFRAME STYLES ──────────────────────────────────────
+STYLES: Dict[str, Dict] = {
+    'Intraday': {
+        'big': '4h',
+        'mid': '1h',
+        'small': '15m',
+        'lookback_days': 30,
+        'fib_lookback': 20,
+    },
+    'Swing': {
+        'big': '1d',
+        'mid': '4h',
+        'small': '1h',
+        'lookback_days': 90,
+        'fib_lookback': 50,
+    },
+}
+
+# ── Indicator settings ──────────────────────────────────────
+BB_PERIOD            = 20
+RSI_PERIOD           = 14
+RSI_OVERSOLD         = 40
+ATR_PERIOD           = 14
+ATR_SL_MULTIPLIER    = 1.5
+OBV_EMA_PERIOD       = 20
+VOL_AVG_PERIOD       = 20
+VOLUME_SPIKE_MULT    = 1.5
+MIN_AVG_VOLUME_USD   = 1_000_000   # Sangat rendah untuk RENDER
+MIN_RR               = 1.5
+MAX_DRIFT_PCT        = 0.06
+ALERT_COOLDOWN_HOURS = 4
+MIN_CONFIDENCE       = 'MEDIUM'
+
+# ============================================================
+# DATA CLASSES
+# ============================================================
+@dataclass
+class Signal:
+    pair:               str
+    style:              str
+    entry_zone_top:     float
+    entry_zone_bottom:  float
+    entry_moderate:     float
+    entry_aggressive:   float
+    sl:                 float
+    tp1:                float
+    tp2:                float
+    tp3:                float
+    rr:                 float
+    rr_aggressive:      float
+    atr:                float
+    confidence:         str
+    confirmations:      List[str] = field(default_factory=list)
+    warnings:           List[str] = field(default_factory=list)
+    fib_382:            float = 0.0
+    fib_50:             float = 0.0
+    fib_confluence:     bool  = False
+    csa_type:           str   = 'CSA_EARLY'
+    btc_score:          str   = ''
+    funding_rate:       Optional[float] = None
+    timestamp:          str   = ''
+    bb_expanding:       bool  = False
+    tf_alignment:       str   = ''
 
 class BBMAState(Enum):
-    NONE = 0
+    NONE        = 0
     EXTREME_BUY = 1
-    EXTREME_SELL = 2
-    MHV_BUY = 3
-    MHV_SELL = 4
-    CSA_BUY = 5
-    CSA_SELL = 6
-    REENTRY_BUY = 7
-    REENTRY_SELL = 8
+    MHV_BUY     = 2
+    CSA_BUY     = 3
+    REENTRY_BUY = 4
 
-# ==========================================
-# 2. INDIKATOR (LWMA 5/10, BB 20/2, EMA50)
-# ==========================================
-def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
-    weights = np.arange(1, period + 1)
-    def lwma(window):
-        return np.sum(window * weights) / np.sum(weights)
-    return series.rolling(window=period).apply(lwma, raw=True)
-
-def get_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Bollinger Bands
-    df['bb_mid'] = df['close'].rolling(BB_PERIOD).mean()
-    bb_std = df['close'].rolling(BB_PERIOD).std()
-    df['bb_upper'] = df['bb_mid'] + (bb_std * BB_STD)
-    df['bb_lower'] = df['bb_mid'] - (bb_std * BB_STD)
-    # LWMA High/Low
-    df['ma5_high'] = calculate_lwma(df['high'], 5)
-    df['ma10_high'] = calculate_lwma(df['high'], 10)
-    df['ma5_low'] = calculate_lwma(df['low'], 5)
-    df['ma10_low'] = calculate_lwma(df['low'], 10)
-    # EMA 50
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-    return df.dropna()
-
-# ==========================================
-# 3. TELEGRAM
-# ==========================================
-def send_telegram(message: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
+# ============================================================
+# ALERT CACHE
+# ============================================================
+def load_cache() -> Dict:
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            print("✅ Alert sent")
-        else:
-            print(f"❌ TG Error: {resp.text}")
-    except Exception as e:
-        print(f"❌ Failed: {e}")
+        if os.path.exists(ALERT_CACHE_PATH):
+            with open(ALERT_CACHE_PATH, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
 
-# ==========================================
-# 4. DATA FETCHER – iTICK
-# ==========================================
-def fetch_itick_data(interval: str, count: int = 200) -> pd.DataFrame:
-    # Map interval ke format iTick
-    interval_map = {
-        '15m': '15m',
-        '1h': '1h',
-        '4h': '4h'
-    }
-    if interval not in interval_map:
-        print(f"❌ Unsupported interval: {interval}")
-        return pd.DataFrame()
-    
-    kline_type = interval_map[interval]
-    url = f"{ITICK_BASE_URL}/future/kline"
-    params = {
-        "region": REGION,
-        "code": SYMBOL_CODE,
-        "kline_type": kline_type,
-        "size": count
-    }
-    headers = {"token": ITICK_API_TOKEN}
-    
-    print(f"📡 Fetching {SYMBOL_CODE} ({interval}) from iTick...")
+def save_cache(cache: Dict):
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
-        data = resp.json()
-        
-        # Debug ringkas
-        if data.get("code") != 0:
-            print(f"❌ iTick error: {data.get('msg', 'Unknown error')}")
-            return pd.DataFrame()
-        
-        if "data" not in data or not data["data"]:
-            print(f"❌ iTick: No data returned")
-            return pd.DataFrame()
-        
-        rows = []
-        for item in data["data"]:
-            # Pastikan semua key ada
-            rows.append({
-                'timestamp': pd.to_datetime(item['t']),
-                'open': float(item['o']),
-                'high': float(item['h']),
-                'low': float(item['l']),
-                'close': float(item['c']),
-                'volume': float(item.get('v', 0))
-            })
-        
-        df = pd.DataFrame(rows)
-        df.set_index('timestamp', inplace=True)
-        df = df.sort_index()
-        
-        if len(df) < 60:
-            print(f"❌ iTick: only {len(df)} candles (need ≥60)")
-            return pd.DataFrame()
-        
-        latest = df['close'].iloc[-1]
-        print(f"✅ iTick {interval}: {len(df)} candles, latest: {latest:.2f}")
-        return df[['open', 'high', 'low', 'close', 'volume']]
-        
+        with open(ALERT_CACHE_PATH, 'w') as f:
+            json.dump(cache, f, indent=2)
     except Exception as e:
-        print(f"❌ iTick exception: {e}")
-        return pd.DataFrame()
+        print(f"⚠️ Cache save failed: {e}")
 
-def fetch_data(interval: str) -> pd.DataFrame:
-    return fetch_itick_data(interval)
-
-# ==========================================
-# 5. MESIN BBMA (EXTREME → MHV → CSA → RE-ENTRY)
-# ==========================================
-class BBMACycleTracker:
-    def __init__(self):
-        self.state = BBMAState.NONE
-        self.extreme_price = None
-        self.mhv_price = None
-        self.csa_confirmed = False
-        self.last_setup_time = None
-
-    def reset(self):
-        self.state = BBMAState.NONE
-        self.extreme_price = None
-        self.mhv_price = None
-        self.csa_confirmed = False
-
-    def update(self, row: pd.Series, prev_row: pd.Series) -> Optional[Dict]:
-        close = row['close']
-        open_ = row['open']
-        high = row['high']
-        low = row['low']
-        bb_upper = row['bb_upper']
-        bb_lower = row['bb_lower']
-        bb_mid = row['bb_mid']
-        ma5_high = row['ma5_high']
-        ma10_high = row['ma10_high']
-        ma5_low = row['ma5_low']
-        ma10_low = row['ma10_low']
-
-        is_bullish = close > open_
-        is_bearish = close < open_
-        prev_bullish = prev_row['close'] > prev_row['open']
-        prev_bearish = prev_row['close'] < prev_row['open']
-
-        # --- EXTREME BUY (MA5/10 Low keluar BB Lower + Reverse Candle) ---
-        if (ma5_low < bb_lower or ma10_low < bb_lower) and is_bullish and prev_bearish:
-            self.state = BBMAState.EXTREME_BUY
-            self.extreme_price = low
-            self.mhv_price = None
-            self.csa_confirmed = False
-            return None
-        
-        # --- EXTREME SELL (MA5/10 High keluar BB Upper + Reverse Candle) ---
-        if (ma5_high > bb_upper or ma10_high > bb_upper) and is_bearish and prev_bullish:
-            self.state = BBMAState.EXTREME_SELL
-            self.extreme_price = high
-            self.mhv_price = None
-            self.csa_confirmed = False
-            return None
-
-        # --- MHV (Selepas Extreme, Candle takleh close luar BB) ---
-        if self.state == BBMAState.EXTREME_BUY:
-            if close < bb_lower:
-                self.reset()
-                return None
-            if is_bearish and prev_bullish:
-                self.state = BBMAState.MHV_BUY
-                self.mhv_price = high
-                return None
-        if self.state == BBMAState.EXTREME_SELL:
-            if close > bb_upper:
-                self.reset()
-                return None
-            if is_bullish and prev_bearish:
-                self.state = BBMAState.MHV_SELL
-                self.mhv_price = low
-                return None
-
-        # --- CSA (Candle Stick Arah) ---
-        if self.state == BBMAState.MHV_BUY:
-            if close > ma5_low and close > ma10_low:
-                self.state = BBMAState.CSA_BUY
-                self.csa_confirmed = True
-                return None
-        if self.state == BBMAState.MHV_SELL:
-            if close < ma5_high and close < ma10_high:
-                self.state = BBMAState.CSA_SELL
-                self.csa_confirmed = True
-                return None
-
-        # --- RE-ENTRY (Selepas CSA, di Zone MA5/10) ---
-        if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
-            in_zone = (low <= ma5_low * 1.002) or (low <= ma10_low * 1.002)
-            if in_zone and is_bullish and prev_bearish and close <= ma5_high and close <= ma10_high and close <= bb_mid:
-                self.state = BBMAState.REENTRY_BUY
-                self.last_setup_time = row.name
-                return {
-                    'type': 'BUY',
-                    'ma5_low': ma5_low, 'ma10_low': ma10_low,
-                    'bb_lower': bb_lower, 'bb_upper': bb_upper,
-                    'ma5_high': ma5_high, 'ma10_high': ma10_high,
-                    'bb_mid': bb_mid,
-                    'current_price': close,
-                    'timestamp': row.name
-                }
-        if self.state == BBMAState.CSA_SELL and self.csa_confirmed:
-            in_zone = (high >= ma5_high * 0.998) or (high >= ma10_high * 0.998)
-            if in_zone and is_bearish and prev_bullish and close >= ma5_low and close >= ma10_low and close >= bb_mid:
-                self.state = BBMAState.REENTRY_SELL
-                self.last_setup_time = row.name
-                return {
-                    'type': 'SELL',
-                    'ma5_high': ma5_high, 'ma10_high': ma10_high,
-                    'bb_upper': bb_upper, 'bb_lower': bb_lower,
-                    'ma5_low': ma5_low, 'ma10_low': ma10_low,
-                    'bb_mid': bb_mid,
-                    'current_price': close,
-                    'timestamp': row.name
-                }
-        return None
-
-# ==========================================
-# 6. LEVEL ENTRY, SL, TP
-# ==========================================
-def calculate_levels_buy(setup: Dict) -> Dict:
-    entry_agg = setup['ma5_low']
-    entry_con = setup['ma10_low']
-    sl = setup['bb_lower'] - 0.50  # Buffer kecil
-    tp1 = setup['ma5_high']
-    tp2 = setup['bb_upper']
-    tp3 = setup['bb_upper'] + (setup['bb_upper'] - setup['bb_mid']) * 0.5
-    return {
-        'aggressive': {'entry': entry_agg, 'sl': sl},
-        'conservative': {'entry': entry_con, 'sl': sl},
-        'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
-        'current_price': setup['current_price']
-    }
-
-def calculate_levels_sell(setup: Dict) -> Dict:
-    entry_agg = setup['ma5_high']
-    entry_con = setup['ma10_high']
-    sl = setup['bb_upper'] + 0.50
-    tp1 = setup['ma5_low']
-    tp2 = setup['bb_lower']
-    tp3 = setup['bb_lower'] - (setup['bb_mid'] - setup['bb_lower']) * 0.5
-    return {
-        'aggressive': {'entry': entry_agg, 'sl': sl},
-        'conservative': {'entry': entry_con, 'sl': sl},
-        'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
-        'current_price': setup['current_price']
-    }
-
-# ==========================================
-# 7. CEK DUPLIKAT (ELAK SPAM)
-# ==========================================
-def get_last_alert() -> Optional[Dict]:
-    if os.path.exists(ALERT_HISTORY_FILE):
-        with open(ALERT_HISTORY_FILE, 'r') as f:
-            return json.load(f)
-    return None
-
-def save_last_alert(setup: Dict):
-    with open(ALERT_HISTORY_FILE, 'w') as f:
-        json.dump({
-            'type': setup['type'],
-            'timestamp': setup['timestamp'].isoformat() if hasattr(setup['timestamp'], 'isoformat') else str(setup['timestamp']),
-            'price': setup['current_price']
-        }, f)
-
-def is_duplicate(setup: Dict) -> bool:
-    last = get_last_alert()
-    if not last:
+def is_duplicate(cache: Dict, ticker: str, style: str) -> bool:
+    key = f"{ticker}_{style}"
+    if key not in cache:
         return False
-    if last['type'] != setup['type']:
-        return False
-    last_time = pd.to_datetime(last['timestamp'])
-    this_time = setup['timestamp']
-    # Jika setup sama dalam tempoh 4 jam, skip
-    if abs((this_time - last_time).total_seconds()) < 14400:
+    elapsed = (datetime.now() - datetime.fromisoformat(cache[key])).total_seconds() / 3600
+    if elapsed < ALERT_COOLDOWN_HOURS:
+        print(f"🔕 Duplicate skip: {key} ({elapsed:.1f}h ago)")
         return True
     return False
 
-# ==========================================
-# 8. FUNGSI UTAMA
-# ==========================================
-def run_analysis():
-    print("\n" + "="*60)
-    print(f"🔍 BBMA FCPO Analyzer (iTick) - {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("="*60)
+def mark_sent(cache: Dict, ticker: str, style: str):
+    cache[f"{ticker}_{style}"] = datetime.now().isoformat()
 
-    for style_name, timeframes in STYLES.items():
-        print(f"\n📊 {style_name} Analysis")
-        print("-"*40)
-        big_tf = timeframes['big']
-        small_tf = timeframes['small']
-        print(f"⏰ Big TF: {big_tf} | Small TF: {small_tf}")
+# ============================================================
+# INDICATORS
+# ============================================================
+def calculate_lwma(series: pd.Series, period: int) -> pd.Series:
+    weights = np.arange(1, period + 1)
+    return series.rolling(window=period).apply(
+        lambda x: np.dot(x, weights) / weights.sum(), raw=True
+    )
 
-        # Ambil data untuk kedua-dua TF
-        df_small = fetch_data(small_tf)
-        if df_small.empty:
-            print(f"❌ No data for {small_tf}")
-            continue
-        df_big = fetch_data(big_tf)
-        if df_big.empty:
-            print(f"❌ No data for {big_tf}")
-            continue
+def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-        # Kira indikator
-        df_small = get_indicators(df_small)
-        df_big = get_indicators(df_big)
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    hl = df['High'] - df['Low']
+    hc = (df['High'] - df['Close'].shift()).abs()
+    lc = (df['Low'] - df['Close'].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
-        latest_price = df_small['close'].iloc[-1]
-        big_latest = df_big['close'].iloc[-1]
-        print(f"💰 Current Price (small): {latest_price:.2f}")
-        print(f"💰 Current Price (big):   {big_latest:.2f}")
+def calculate_obv_vectorized(df: pd.DataFrame) -> pd.Series:
+    direction = np.sign(df['Close'].diff().fillna(0))
+    return (direction * df['Volume']).cumsum()
 
-        # Track setup
-        tracker = BBMACycleTracker()
-        setups = []
-        for i in range(20, len(df_small)):
-            result = tracker.update(df_small.iloc[i], df_small.iloc[i-1])
+def calculate_fibonacci(high: float, low: float) -> Dict[str, float]:
+    diff = high - low
+    return {
+        '0.236': high - 0.236 * diff,
+        '0.382': high - 0.382 * diff,
+        '0.500': high - 0.500 * diff,
+        '0.618': high - 0.618 * diff,
+    }
+
+def get_indicators(df: pd.DataFrame, bb_std: float = 2.0) -> pd.DataFrame:
+    df = df.copy()
+    df['bb_mid'] = df['Close'].rolling(BB_PERIOD).mean()
+    _std = df['Close'].rolling(BB_PERIOD).std()
+    df['bb_upper'] = df['bb_mid'] + (_std * bb_std)
+    df['bb_lower'] = df['bb_mid'] - (_std * bb_std)
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
+    df['bb_width_prev'] = df['bb_width'].shift(5)
+    df['bb_expanding'] = df['bb_width'] > df['bb_width_prev'] * 1.05
+    df['ma5_high'] = calculate_lwma(df['High'], 5)
+    df['ma10_high'] = calculate_lwma(df['High'], 10)
+    df['ma5_low'] = calculate_lwma(df['Low'], 5)
+    df['ma10_low'] = calculate_lwma(df['Low'], 10)
+    df['ema50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['rsi'] = calculate_rsi(df['Close'], RSI_PERIOD)
+    df['atr'] = calculate_atr(df, ATR_PERIOD)
+    df['obv'] = calculate_obv_vectorized(df)
+    df['obv_ema'] = df['obv'].ewm(span=OBV_EMA_PERIOD, adjust=False).mean()
+    df['obv_bullish'] = df['obv'] > df['obv_ema']
+    df['vol_avg20'] = df['Volume'].rolling(VOL_AVG_PERIOD).mean()
+    df['vol_ratio'] = df['Volume'] / df['vol_avg20']
+    df['vol_spike'] = df['vol_ratio'] >= VOLUME_SPIKE_MULT
+    return df.dropna()
+
+# ============================================================
+# MULTI-TICKER FETCH
+# ============================================================
+def get_max_lookback(interval: str, requested_days: int) -> int:
+    total_days = requested_days + 30
+    if interval == '15m':
+        return min(total_days, 59)
+    elif interval in ['1h', '30m']:
+        return min(total_days, 730)
+    elif interval in ['4h', '1d', '5d']:
+        return min(total_days, 3650)
+    else:
+        return min(total_days, 730)
+
+def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int) -> Dict[str, pd.DataFrame]:
+    try:
+        end = datetime.now()
+        actual_days = get_max_lookback(interval, lookback_days)
+        start = end - timedelta(days=actual_days)
+        print(f"  📥 {interval}: requesting {actual_days} days")
+        data = yf.download(
+            tickers, 
+            start=start, 
+            end=end, 
+            interval=interval, 
+            progress=False, 
+            group_by='ticker',
+            auto_adjust=True,
+            threads=True,
+        )
+        results = {}
+        for ticker in tickers:
+            if ticker in data:
+                df = data[ticker]
+                if not df.empty and len(df) > 30:
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.droplevel(1)
+                    col_map = {}
+                    for c in df.columns:
+                        lc = c.lower()
+                        if 'open' in lc: col_map[c] = 'Open'
+                        elif 'high' in lc: col_map[c] = 'High'
+                        elif 'low' in lc: col_map[c] = 'Low'
+                        elif 'close' in lc: col_map[c] = 'Close'
+                        elif 'vol' in lc: col_map[c] = 'Volume'
+                    df.rename(columns=col_map, inplace=True)
+                    results[ticker] = df
+                else:
+                    print(f"  ⚠️ Insufficient data {ticker} ({interval}) — {len(df)} candles")
+            else:
+                print(f"  ⚠️ {ticker} not in response ({interval})")
+        return results
+    except Exception as e:
+        print(f"❌ Multi-fetch failed ({interval}): {e}")
+        return {}
+
+# ============================================================
+# LIQUIDITY & BTC FILTERS
+# ============================================================
+def check_liquidity(df: pd.DataFrame, ticker: str) -> bool:
+    avg = (df['Close'].tail(20) * df['Volume'].tail(20)).mean()
+    if avg < MIN_AVG_VOLUME_USD:
+        print(f"🚫 Liquidity fail {ticker}: ${avg:,.0f}")
+        return False
+    return True
+
+def get_btc_structure_from_df(df: pd.DataFrame) -> Optional[Dict]:
+    """Get BTC structure for DISPLAY purposes only — NOT used to block."""
+    if df.empty or len(df) < 5:
+        return None
+    df = get_indicators(df, bb_std=2.0)
+    if df.empty:
+        return None
+    last, prev = df.iloc[-1], df.iloc[-2]
+    c1 = bool(last['Close'] > last['ema50'])
+    c2 = bool(last['ema50'] > prev['ema50'])
+    c3 = bool(last['obv_bullish'])
+    n = sum([c1, c2, c3])
+    bullish = (n >= 2)
+    return {'bullish': bullish, 'score': f"{n}/3"}
+
+# ============================================================
+# FUNDING RATE
+# ============================================================
+def fetch_funding_rate(symbol: str) -> Optional[float]:
+    if not COINGLASS_API_KEY:
+        return None
+    try:
+        url = f"https://open-api.coinglass.com/public/v2/funding?symbol={symbol}&timeType=h8"
+        resp = requests.get(url, headers={"coinglassSecret": COINGLASS_API_KEY}, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('data'):
+                return float(data['data'][0].get('rate', 0))
+    except Exception:
+        pass
+    return None
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+def send_telegram(message: str):
+    if DRY_RUN:
+        print(f"[DRY RUN]\n{message[:300]}...")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
+    for chunk in chunks:
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': chunk,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        }
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            if resp.status_code != 200:
+                print(f"❌ TG Error: {resp.text}")
+        except Exception as e:
+            print(f"❌ Send failed: {e}")
+        time.sleep(0.5)
+
+# ============================================================
+# BBMA STATE MACHINE
+# ============================================================
+class BBMABuyTracker:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state = BBMAState.NONE
+        self.extreme_low = None
+        self.extreme_index = None
+        self.rsi_at_extreme = None
+        self.mhv_confirmed = False
+        self.csa_confirmed = False
+        self.csa_type = 'CSA_EARLY'
+        self.mhv_low = None
+        self.double_bottom = False
+
+    def update(self, row: pd.Series, prev: pd.Series, idx: int) -> Optional[Dict]:
+        close = row['Close']; open_ = row['Open']
+        low = row['Low']; high = row['High']
+        bb_lower = row['bb_lower']; bb_mid = row['bb_mid']
+        ma5_high = row['ma5_high']; ma10_high = row['ma10_high']
+        ma5_low = row['ma5_low']; ma10_low = row['ma10_low']
+        rsi = row['rsi']
+        obv_bull = bool(row['obv_bullish'])
+        vol_spike = bool(row['vol_spike'])
+        bull = close > open_
+        bear = close < open_
+        p_bear = prev['Close'] < prev['Open']
+
+        # 1. EXTREME BUY
+        is_extreme = (ma5_low < bb_lower) or (ma10_low < bb_lower)
+        if is_extreme and bull and p_bear:
+            self.state = BBMAState.EXTREME_BUY
+            self.extreme_low = low
+            self.extreme_index = idx
+            self.rsi_at_extreme = rsi
+            self.mhv_confirmed = False
+            self.csa_confirmed = False
+            self.double_bottom = False
+            return None
+
+        # 2. MHV (Double Bottom)
+        if self.state == BBMAState.EXTREME_BUY and self.extreme_low is not None:
+            test_low = low <= (self.extreme_low * 1.01)
+            rejected = close > bb_lower
+            if test_low and rejected and bear:
+                self.state = BBMAState.MHV_BUY
+                self.mhv_confirmed = True
+                self.mhv_low = low
+                self.double_bottom = True
+                return None
+            if close < bb_lower * 0.99:
+                self.reset()
+                return None
+
+        # 3. CS ARAH
+        if self.state == BBMAState.MHV_BUY and self.mhv_confirmed:
+            csa_early = close > ma5_low and close > ma10_low
+            csa_kukuh = csa_early and close > bb_mid
+            if csa_early and bull and p_bear:
+                self.state = BBMAState.CSA_BUY
+                self.csa_confirmed = True
+                self.csa_type = 'CSA_KUKUH' if csa_kukuh else 'CSA_EARLY'
+                return None
+            if close < bb_lower:
+                self.reset()
+                return None
+
+        # 4. RE-ENTRY BUY
+        if self.state == BBMAState.CSA_BUY and self.csa_confirmed:
+            zone_top = max(ma5_low, ma10_low)
+            zone_bottom = min(ma5_low, ma10_low)
+            near_zone = zone_bottom * 0.985 <= low <= zone_top * 1.015
+            not_crashed = close >= zone_bottom * 0.98
+            below_resist = close <= ma5_high and close <= ma10_high and close <= bb_mid
+            reversal = bull and p_bear
+
+            if near_zone and not_crashed and below_resist and reversal and obv_bull and vol_spike:
+                self.state = BBMAState.REENTRY_BUY
+                return {
+                    'zone_top': zone_top,
+                    'zone_bottom': zone_bottom,
+                    'trigger_price': close,
+                    'obv_confirmed': obv_bull,
+                    'vol_spike': vol_spike,
+                    'rsi': rsi,
+                    'csa_type': self.csa_type,
+                    'mhv_low': self.mhv_low,
+                    'double_bottom': self.double_bottom,
+                }
+        return None
+
+# ============================================================
+# LEVEL CALCULATION
+# ============================================================
+def calculate_levels(signal: Dict, current_price: float,
+                     df: pd.DataFrame, fib_lookback: int = 20) -> Optional[Dict]:
+    last = df.iloc[-1]
+    zone_top = signal['zone_top']
+    zone_bottom = signal['zone_bottom']
+    zone_center = (zone_top + zone_bottom) / 2
+
+    drift = abs(current_price - zone_center) / zone_center
+    if drift > MAX_DRIFT_PCT:
+        print(f"⚠️ Setup expired: drifted {drift:.1%}")
+        return None
+
+    swing_high = df['High'].iloc[-fib_lookback:].max()
+    swing_low = df['Low'].iloc[-fib_lookback:].min()
+    fibs = calculate_fibonacci(swing_high, swing_low)
+    fib_382 = fibs['0.382']
+    fib_50 = fibs['0.500']
+    fib_conf = (abs(zone_center - fib_382) / zone_center < 0.02 or
+                abs(zone_center - fib_50) / zone_center < 0.02)
+
+    atr = last['atr']
+    sl_bb = last['bb_lower']
+    sl_atr = zone_center - (atr * ATR_SL_MULTIPLIER)
+    sl = min(sl_bb, sl_atr)
+
+    entry_mod = zone_center
+    entry_agg = zone_bottom
+    tp1 = last['ma5_high']
+    tp2 = last['bb_mid']
+    tp3 = last['bb_upper']
+
+    def rr(entry):
+        return (tp2 - entry) / (entry - sl) if entry > sl else 0
+
+    return {
+        'moderate': {'entry': entry_mod, 'sl': sl, 'rr': rr(entry_mod)},
+        'aggressive': {'entry': entry_agg, 'sl': sl, 'rr': rr(entry_agg)},
+        'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
+        'zone_top': zone_top,
+        'zone_bottom': zone_bottom,
+        'atr': atr,
+        'fib_confluence': fib_conf,
+        'fib_382': fib_382,
+        'fib_50': fib_50,
+        'drift_pct': drift,
+        'bb_expanding': bool(last['bb_expanding']),
+    }
+
+# ============================================================
+# CONFIDENCE SCORING
+# ============================================================
+CONFIDENCE_MAP = {(0,2): 'LOW', (3,5): 'MEDIUM', (6,8): 'HIGH', (9,99): 'PERFECT'}
+
+def score_to_label(score: int) -> str:
+    for (lo, hi), label in CONFIDENCE_MAP.items():
+        if lo <= score <= hi:
+            return label
+    return 'LOW'
+
+def calculate_confidence(df: pd.DataFrame, levels: Dict, signal: Dict,
+                         btc_ctx: Dict, funding_rate: Optional[float],
+                         tf_alignment: str) -> Tuple[str, List[str], List[str]]:
+    confirmations: List[str] = []
+    warnings: List[str] = []
+    score = 0
+    last = df.iloc[-1]
+
+    if signal.get('vol_spike'):
+        confirmations.append(f"Volume spike {last['vol_ratio']:.1f}× avg ✅")
+        score += 2
+    else:
+        warnings.append(f"Volume weak ({last['vol_ratio']:.1f}× avg)")
+
+    if signal.get('obv_confirmed'):
+        confirmations.append("OBV bullish — accumulation ✅")
+        score += 2
+    else:
+        warnings.append("OBV diverging")
+
+    rsi = signal.get('rsi', last['rsi'])
+    if rsi <= RSI_OVERSOLD:
+        confirmations.append(f"RSI {rsi:.1f} — oversold ✅")
+        score += 1
+    else:
+        warnings.append(f"RSI {rsi:.1f} — not oversold")
+
+    atr_pct = levels['atr'] / last['Close'] * 100
+    if atr_pct < 5:
+        confirmations.append(f"ATR {atr_pct:.1f}% — low vol ✅")
+        score += 1
+    elif atr_pct > 10:
+        warnings.append(f"High vol ATR {atr_pct:.1f}%")
+
+    if levels.get('fib_confluence'):
+        confirmations.append(f"Fib confluence (38.2={levels['fib_382']:.4f}) ✅")
+        score += 1
+    else:
+        warnings.append("No Fib confluence")
+
+    # ─── BTC IS NOW JUST A BONUS, NOT A BLOCKER ───
+    if btc_ctx and btc_ctx['bullish']:
+        confirmations.append(f"BTC bullish ({btc_ctx['score']}) ✅")
+        score += 1
+    else:
+        warnings.append(f"BTC not bullish ({btc_ctx['score'] if btc_ctx else 'N/A'}) — but scanning anyway")
+
+    if funding_rate is not None and funding_rate < 0:
+        confirmations.append(f"Funding {funding_rate:.4f}% — shorts paying ✅")
+        score += 1
+
+    rr = levels['moderate']['rr']
+    if rr >= 2.0:
+        confirmations.append(f"R/R {rr:.1f}× — excellent ✅")
+        score += 2
+    elif rr >= MIN_RR:
+        confirmations.append(f"R/R {rr:.1f}× — good")
+        score += 1
+    else:
+        warnings.append(f"R/R {rr:.1f}× — low")
+
+    if signal.get('csa_type') == 'CSA_KUKUH':
+        confirmations.append("CS Arah Kukuh ✅")
+        score += 1
+
+    if levels.get('bb_expanding'):
+        confirmations.append("BB expanding (momentum ✅)")
+        score += 1
+    else:
+        warnings.append("BB mampat — sideway risk")
+
+    if "R-E-M" in tf_alignment:
+        confirmations.append(f"3-TF Alignment ({tf_alignment}) ✅")
+        score += 2
+    elif "R-E" in tf_alignment:
+        confirmations.append(f"2-TF Alignment ({tf_alignment})")
+        score += 1
+
+    return score_to_label(score), confirmations, warnings
+
+# ============================================================
+# TELEGRAM ALERT
+# ============================================================
+def build_alert(signal_obj: Signal, tfs: Dict) -> str:
+    conf_emoji = {'LOW': '⚠️', 'MEDIUM': '👍', 'HIGH': '🔥', 'PERFECT': '💎'}
+    emoji = conf_emoji.get(signal_obj.confidence, '👍')
+    csa_label = "CS Arah Kukuh 💪" if signal_obj.csa_type == 'CSA_KUKUH' else "CS Arah Awal"
+
+    confs = "\n".join([f"  ✅ {c}" for c in signal_obj.confirmations]) or "  —"
+    warns = "\n".join([f"  ⚠️ {w}" for w in signal_obj.warnings]) or "  ✅ None"
+    funding_line = f"\n• Funding Rate : {signal_obj.funding_rate:.4f}%" if signal_obj.funding_rate is not None else ""
+    fib_line = f"\n• Fib 38.2%    : {signal_obj.fib_382:.4f}  |  50%: {signal_obj.fib_50:.4f}" if signal_obj.fib_confluence else ""
+
+    return f"""
+🟢 <b>BBMA BUY SETUP</b> {emoji} <b>{signal_obj.confidence}</b>
+
+📊 <b>{signal_obj.pair}</b>  |  {signal_obj.style}  ({tfs['big']}→{tfs['mid']}→{tfs['small']})
+🎯 Pattern : Re-Entry Buy ({csa_label})
+⏰ Time    : {signal_obj.timestamp}
+🧩 Alignment: {signal_obj.tf_alignment}
+
+━━━━━━━━━━━━━━━━━━━━
+
+🌐 <b>MARKET CONTEXT</b>
+• BTC Structure : {signal_obj.btc_score} (INFO only — not a blocker)
+• BB Expanding  : {"✅ Yes" if signal_obj.bb_expanding else "❌ No"}
+• ATR (Vol)     : {signal_obj.atr:.4f}  ({signal_obj.atr / signal_obj.entry_moderate * 100:.1f}%){funding_line}{fib_line}
+
+━━━━━━━━━━━━━━━━━━━━
+
+📐 <b>ENTRY ZONE</b>
+• Zone Top    : {signal_obj.entry_zone_top:.4f}
+• Zone Bottom : {signal_obj.entry_zone_bottom:.4f}
+
+🟡 <b>MODERATE ⭐ RECOMMENDED</b>
+• Entry : {signal_obj.entry_moderate:.4f}
+• SL    : {signal_obj.sl:.4f}
+• R/R   : {signal_obj.rr:.1f}×
+
+🔴 <b>AGGRESSIVE</b>
+• Entry : {signal_obj.entry_aggressive:.4f}
+• SL    : {signal_obj.sl:.4f}
+• R/R   : {signal_obj.rr_aggressive:.1f}×
+
+🎯 <b>TARGETS</b>
+• TP1 : {signal_obj.tp1:.4f}  (MA5 High)
+• TP2 : {signal_obj.tp2:.4f}  (Mid BB)  ← Wajib
+• TP3 : {signal_obj.tp3:.4f}  (Upper BB)
+
+━━━━━━━━━━━━━━━━━━━━
+
+✅ <b>CONFIRMATIONS</b>
+{confs}
+
+⚠️ <b>WARNINGS</b>
+{warns}
+
+━━━━━━━━━━━━━━━━━━━━
+<i>⚡ Verify live price. Not financial advice.</i>
+"""
+
+# ============================================================
+# CORE SCANNER
+# ============================================================
+def scan_single_pair_with_dfs(ticker: str, pair_cfg: Dict, cache: Dict,
+                              df_big: pd.DataFrame, df_mid: pd.DataFrame,
+                              df_small: pd.DataFrame, btc_ctx: Dict,
+                              tfs: Dict, style: str, fib_lookback: int):
+    """Scan a single pair using pre-fetched dataframes."""
+    bb_std = pair_cfg.get('bb_std', 2.0)
+
+    try:
+        if is_duplicate(cache, ticker, style):
+            return
+
+        if df_big.empty or df_mid.empty or df_small.empty:
+            return
+
+        df_big = get_indicators(df_big, bb_std)
+        df_mid = get_indicators(df_mid, bb_std)
+        df_small = get_indicators(df_small, bb_std)
+
+        if df_big.empty or df_mid.empty or df_small.empty:
+            return
+
+        if not check_liquidity(df_big, ticker):
+            return
+
+        last_big = df_big.iloc[-1]
+        if not (last_big['ema50'] < last_big['bb_mid']):
+            print(f"  ⏭️  {ticker} Big TF not uptrend")
+            return
+
+        zone_top_big = max(last_big['ma5_low'], last_big['ma10_low'])
+        zone_bottom_big = min(last_big['ma5_low'], last_big['ma10_low'])
+        price_big = last_big['Close']
+        if not (zone_bottom_big * 0.98 <= price_big <= zone_top_big * 1.02):
+            print(f"  ⏭️  {ticker} Big TF not in Re-entry zone")
+            return
+
+        last_mid = df_mid.iloc[-1]
+        is_extreme = (last_mid['ma5_low'] < last_mid['bb_lower']) or (last_mid['ma10_low'] < last_mid['bb_lower'])
+        if not is_extreme:
+            print(f"  ⏭️  {ticker} Mid TF no Extreme")
+            return
+
+        tracker = BBMABuyTracker()
+        setup_found = None
+        for i in range(1, len(df_small)):
+            result = tracker.update(df_small.iloc[i], df_small.iloc[i-1], i)
             if result:
-                setups.append(result)
+                setup_found = result
+                break
 
-        if not setups:
-            print("   No setup found")
-            continue
+        if not setup_found:
+            print(f"  ⏭️  {ticker} Small TF no MHV/CSA")
+            return
 
-        setup = setups[-1]
-        print(f"\n📈 Latest Setup: {setup['type']} at {setup['current_price']:.2f}")
+        current_price = df_small.iloc[-1]['Close']
+        levels = calculate_levels(setup_found, current_price, df_small, fib_lookback)
+        if not levels:
+            return
 
-        if is_duplicate(setup):
-            print("   ⏳ Skipping duplicate alert (same setup already sent)")
-            continue
+        if levels['moderate']['rr'] < MIN_RR:
+            print(f"  ⏭️  {ticker} R/R {levels['moderate']['rr']:.1f}× < {MIN_RR}×")
+            return
 
-        # Bina mesej
-        if setup['type'] == 'BUY':
-            levels = calculate_levels_buy(setup)
-            msg = f"""
-📊 <b>BBMA SETUP DETECTED - {style_name}</b>
+        symbol = ticker.replace('-USD', '')
+        funding_rate = fetch_funding_rate(symbol)
+        tf_label = "R-E-M"
 
-Pair: FCPO (Crude Palm Oil Futures)
-Type: BUY
-Current: {setup['current_price']:.2f}
+        confidence, confs, warns = calculate_confidence(
+            df_small, levels, setup_found, btc_ctx, funding_rate, tf_label
+        )
 
-<b>🔥 AGGRESSIVE ENTRY</b>
-Entry: {levels['aggressive']['entry']:.2f}
-SL:   {levels['aggressive']['sl']:.2f}
+        CONF_ORDER = ['LOW', 'MEDIUM', 'HIGH', 'PERFECT']
+        if CONF_ORDER.index(confidence) < CONF_ORDER.index(MIN_CONFIDENCE):
+            print(f"  ⏭️  {ticker} Confidence {confidence} below {MIN_CONFIDENCE}")
+            return
 
-<b>🛡️ CONSERVATIVE ENTRY</b>
-Entry: {levels['conservative']['entry']:.2f}
-SL:   {levels['conservative']['sl']:.2f}
+        pair_name = ticker.replace('-USD', '/USDT')
+        sig = Signal(
+            pair=pair_name,
+            style=style,
+            entry_zone_top=levels['zone_top'],
+            entry_zone_bottom=levels['zone_bottom'],
+            entry_moderate=levels['moderate']['entry'],
+            entry_aggressive=levels['aggressive']['entry'],
+            sl=levels['moderate']['sl'],
+            tp1=levels['tp1'],
+            tp2=levels['tp2'],
+            tp3=levels['tp3'],
+            rr=levels['moderate']['rr'],
+            rr_aggressive=levels['aggressive']['rr'],
+            atr=levels['atr'],
+            confidence=confidence,
+            confirmations=confs,
+            warnings=warns,
+            fib_382=levels['fib_382'],
+            fib_50=levels['fib_50'],
+            fib_confluence=levels['fib_confluence'],
+            csa_type=setup_found.get('csa_type', 'CSA_EARLY'),
+            btc_score=btc_ctx['score'] if btc_ctx else 'N/A',
+            funding_rate=funding_rate,
+            timestamp=datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
+            bb_expanding=levels['bb_expanding'],
+            tf_alignment=tf_label,
+        )
 
-<b>🎯 TAKE PROFITS</b>
-TP1: {levels['tp1']:.2f}
-TP2: {levels['tp2']:.2f}
-TP3: {levels['tp3']:.2f}
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
-"""
-        else:  # SELL
-            levels = calculate_levels_sell(setup)
-            msg = f"""
-📊 <b>BBMA SETUP DETECTED - {style_name}</b>
-
-Pair: FCPO (Crude Palm Oil Futures)
-Type: SELL
-Current: {setup['current_price']:.2f}
-
-<b>🔥 AGGRESSIVE ENTRY</b>
-Entry: {levels['aggressive']['entry']:.2f}
-SL:   {levels['aggressive']['sl']:.2f}
-
-<b>🛡️ CONSERVATIVE ENTRY</b>
-Entry: {levels['conservative']['entry']:.2f}
-SL:   {levels['conservative']['sl']:.2f}
-
-<b>🎯 TAKE PROFITS</b>
-TP1: {levels['tp1']:.2f}
-TP2: {levels['tp2']:.2f}
-TP3: {levels['tp3']:.2f}
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
-"""
-
+        msg = build_alert(sig, tfs)
         send_telegram(msg)
-        save_last_alert(setup)
-        print("✅ Alert sent and saved")
+        mark_sent(cache, ticker, style)
+        print(f"  🚨 ALERT: {pair_name} @ {current_price:.4f} | {confidence}")
+
+    except Exception as e:
+        print(f"  ❌ Error scanning {ticker}: {e}")
+        traceback.print_exc()
+
+# ============================================================
+# MAIN — NO BTC BLOCKER, ONLY RENDER
+# ============================================================
+def main():
+    print(f"\n{'='*50}")
+    print(f"  BBMA 9.9 SPOT SCANNER (RENDER-USD ONLY)")
+    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Pairs: {len(PAIRS)} | Styles: {', '.join(STYLES)}")
+    print(f"  BTC Filter: DISABLED as blocker (INFO only)")
+    print(f"  Min Liquidity: ${MIN_AVG_VOLUME_USD:,.0f}")
+    print(f"  Cooldown: {ALERT_COOLDOWN_HOURS}h | Min R/R: {MIN_RR}×")
+    print(f"  Min Confidence: {MIN_CONFIDENCE} | DRY RUN: {DRY_RUN}")
+    print(f"{'='*50}")
+
+    cache = load_cache()
+    tickers = list(PAIRS.keys())
+    alert_count = 0
+    btc_ctx = None
+
+    for style, tfs in STYLES.items():
+        print(f"\n{'─'*45}")
+        print(f"  STYLE: {style} ({tfs['big']}→{tfs['mid']}→{tfs['small']})")
+        print(f"{'─'*45}")
+
+        days = tfs['lookback_days']
+        fib_lookback = tfs['fib_lookback']
+
+        print(f"  📡 Fetching {len(tickers)} tickers on {tfs['big']}...")
+        big_data = fetch_multiple_tickers(tickers, tfs['big'], days)
+        if not big_data:
+            print("  ⚠️ Big TF fetch failed, skipping style")
+            continue
+
+        print(f"  📡 Fetching {len(tickers)} tickers on {tfs['mid']}...")
+        mid_data = fetch_multiple_tickers(tickers, tfs['mid'], days)
+        if not mid_data:
+            print("  ⚠️ Mid TF fetch failed, skipping style")
+            continue
+
+        print(f"  📡 Fetching {len(tickers)} tickers on {tfs['small']}...")
+        small_data = fetch_multiple_tickers(tickers, tfs['small'], days)
+        if not small_data:
+            print("  ⚠️ Small TF fetch failed, skipping style")
+            continue
+
+        # ─── BTC CONTEXT — DISPLAY ONLY, NO BLOCK ───
+        btc_df = big_data.get('BTC-USD')
+        btc_ctx = get_btc_structure_from_df(btc_df) if btc_df is not None else None
+        if btc_ctx is None:
+            print("  📊 BTC data unavailable — scanning RENDER anyway")
+        else:
+            print(f"  📊 BTC Structure: {btc_ctx['score']} ({'Bullish' if btc_ctx['bullish'] else 'Bearish'}) — SCANNING RENDER REGARDLESS")
+
+        for ticker, cfg in PAIRS.items():
+            df_big = big_data.get(ticker)
+            df_mid = mid_data.get(ticker)
+            df_small = small_data.get(ticker)
+
+            if df_big is None or df_mid is None or df_small is None:
+                print(f"  ⏭️ Missing data for {ticker}")
+                continue
+
+            scan_single_pair_with_dfs(
+                ticker, cfg, cache,
+                df_big, df_mid, df_small,
+                btc_ctx, tfs, style, fib_lookback
+            )
+
+        style_keys = [k for k in cache.keys() if k.endswith(f"_{style}")]
+        alert_count += len([k for k in style_keys if cache[k] > (datetime.now() - timedelta(hours=1)).isoformat()])
+
+    save_cache(cache)
+
+    if not DRY_RUN:
+        heartbeat = f"""
+🔵 <b>BBMA Scanner Heartbeat</b>
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
+📊 Coins scanned: {len(PAIRS)}
+📈 Alerts sent (last hour): {alert_count}
+🟢 BTC Structure: {btc_ctx['score'] if btc_ctx else 'N/A'} ({'Bullish' if btc_ctx and btc_ctx['bullish'] else 'Bearish'}) — FOR INFO ONLY
+✅ Status: Running (Focused on RENDER-USD only)
+"""
+        send_telegram(heartbeat)
+
+    print(f"\n{'='*50}")
+    print("  Scan Complete")
+    print(f"{'='*50}\n")
 
 if __name__ == "__main__":
-    run_analysis()
+    main()
