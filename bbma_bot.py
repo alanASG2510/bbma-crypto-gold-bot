@@ -1,26 +1,28 @@
 """
-BBMA Crypto Spot Scanner — RENDER-USD ONLY
-===========================================
+BBMA Crypto Spot Scanner — BINANCE + YAHOO FALLBACK
+====================================================
 BUY ONLY | Spot Trading | Intraday + Swing
 
-✅ FOCUSED: Only scans RENDER-USD
-✅ LIQUIDITY: Lowered to $1M to avoid Yahoo volume gaps
+✅ PRIMARY: Binance API with automatic retry (429/500/503)
+✅ FALLBACK: Yahoo Finance (if Binance geo-blocked or fails)
+✅ FOCUSED: RENDER-USD (RENDERUSDT)
 ✅ BTC FILTER: Disabled (info only)
-✅ 15m data capped to 59 days
 """
 
 import os
 import json
 import time
 import traceback
-import yfinance as yf
+import requests
 import pandas as pd
 import numpy as np
-import requests
+import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 from dataclasses import dataclass, field
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ============================================================
 # CONFIGURATION
@@ -28,15 +30,20 @@ from dataclasses import dataclass, field
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID')
 DRY_RUN            = os.environ.get('DRY_RUN', 'false').lower() == 'true'
-COINGLASS_API_KEY  = os.environ.get('COINGLASS_API_KEY')
 ALERT_CACHE_PATH   = os.environ.get('ALERT_CACHE_PATH', 'alert_cache.json')
 
 if not DRY_RUN and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
     raise ValueError("Missing Telegram credentials!")
 
-# ── PER-PAIR CONFIG (HANYA RENDER) ────────────────────────────
+# ── BINANCE PAIRS (RENDER SAHAJA) ────────────────────────────
 PAIRS: Dict[str, Dict] = {
-    'RENDER-USD': {'bb_std': 2.8, 'vol_threshold': 1.8},
+    'RENDERUSDT': {
+        'bb_std': 2.8,
+        'vol_threshold': 1.8,
+        'display': 'RENDER/USDT',
+        'gecko_id': 'render',      # Untuk fallback CoinGecko (optional)
+        'yahoo_ticker': 'RENDER-USD'
+    },
 }
 
 # ── 3-TIMEFRAME STYLES ──────────────────────────────────────
@@ -45,15 +52,17 @@ STYLES: Dict[str, Dict] = {
         'big': '4h',
         'mid': '1h',
         'small': '15m',
-        'lookback_days': 30,
         'fib_lookback': 20,
+        'binance_limit': 500,
+        'yahoo_days': 30,
     },
     'Swing': {
         'big': '1d',
         'mid': '4h',
         'small': '1h',
-        'lookback_days': 90,
         'fib_lookback': 50,
+        'binance_limit': 500,
+        'yahoo_days': 90,
     },
 }
 
@@ -66,7 +75,7 @@ ATR_SL_MULTIPLIER    = 1.5
 OBV_EMA_PERIOD       = 20
 VOL_AVG_PERIOD       = 20
 VOLUME_SPIKE_MULT    = 1.5
-MIN_AVG_VOLUME_USD   = 1_000_000   # Sangat rendah untuk RENDER
+MIN_AVG_VOLUME_USD   = 1_000_000
 MIN_RR               = 1.5
 MAX_DRIFT_PCT        = 0.06
 ALERT_COOLDOWN_HOURS = 4
@@ -78,6 +87,7 @@ MIN_CONFIDENCE       = 'MEDIUM'
 @dataclass
 class Signal:
     pair:               str
+    display_name:       str
     style:              str
     entry_zone_top:     float
     entry_zone_bottom:  float
@@ -98,10 +108,10 @@ class Signal:
     fib_confluence:     bool  = False
     csa_type:           str   = 'CSA_EARLY'
     btc_score:          str   = ''
-    funding_rate:       Optional[float] = None
     timestamp:          str   = ''
     bb_expanding:       bool  = False
     tf_alignment:       str   = ''
+    data_source:        str   = 'Binance'  # Track source
 
 class BBMAState(Enum):
     NONE        = 0
@@ -141,6 +151,129 @@ def is_duplicate(cache: Dict, ticker: str, style: str) -> bool:
 
 def mark_sent(cache: Dict, ticker: str, style: str):
     cache[f"{ticker}_{style}"] = datetime.now().isoformat()
+
+# ============================================================
+# BINANCE SESSION WITH RETRY
+# ============================================================
+def get_binance_session() -> requests.Session:
+    """Create a session with automatic retry for 429/500/502/503/504."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=2,  # 2s, 4s, 8s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+    return session
+
+BINANCE_SESSION = get_binance_session()
+
+# ============================================================
+# FETCH FUNCTIONS (Binance + Yahoo Fallback)
+# ============================================================
+def fetch_binance_data(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    """Fetch kline from Binance with retry session."""
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        print(f"  📥 Binance: {symbol} ({interval}) limit={limit}")
+        
+        resp = BINANCE_SESSION.get(url, params=params, timeout=30)
+        
+        if resp.status_code == 451:
+            print(f"  ⚠️ Binance geo-blocked (451) for {symbol}")
+            return pd.DataFrame()
+        if resp.status_code != 200:
+            print(f"  ⚠️ Binance error {resp.status_code}: {resp.text[:100]}")
+            return pd.DataFrame()
+        
+        data = resp.json()
+        if not data:
+            print(f"  ⚠️ No data from Binance for {symbol} ({interval})")
+            return pd.DataFrame()
+        
+        rows = []
+        for candle in data:
+            rows.append({
+                'Open': float(candle[1]),
+                'High': float(candle[2]),
+                'Low': float(candle[3]),
+                'Close': float(candle[4]),
+                'Volume': float(candle[5]),
+                'OpenTime': datetime.fromtimestamp(candle[0] / 1000),
+                'CloseTime': datetime.fromtimestamp(candle[6] / 1000),
+            })
+        
+        df = pd.DataFrame(rows)
+        df.set_index('OpenTime', inplace=True)
+        return df
+        
+    except requests.exceptions.ConnectionError:
+        print(f"  ⚠️ Binance connection error for {symbol}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"  ❌ Binance error ({symbol} {interval}): {e}")
+        return pd.DataFrame()
+
+def fetch_yahoo_fallback(ticker: str, interval: str, days: int) -> pd.DataFrame:
+    """Fallback to Yahoo Finance if Binance fails."""
+    try:
+        print(f"  📥 Yahoo Fallback: {ticker} ({interval}) days={days}")
+        end = datetime.now()
+        start = end - timedelta(days=days + 30)
+        df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
+        if df.empty:
+            print(f"  ⚠️ Yahoo no data for {ticker} ({interval})")
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        col_map = {}
+        for c in df.columns:
+            lc = c.lower()
+            if 'open' in lc: col_map[c] = 'Open'
+            elif 'high' in lc: col_map[c] = 'High'
+            elif 'low' in lc: col_map[c] = 'Low'
+            elif 'close' in lc: col_map[c] = 'Close'
+            elif 'vol' in lc: col_map[c] = 'Volume'
+        df.rename(columns=col_map, inplace=True)
+        if len(df) < 30:
+            return pd.DataFrame()
+        return df
+    except Exception as e:
+        print(f"  ❌ Yahoo error: {e}")
+        return pd.DataFrame()
+
+def fetch_with_fallback(ticker: str, binance_symbol: str, yahoo_ticker: str,
+                        interval: str, limit: int, yahoo_days: int) -> pd.DataFrame:
+    """Try Binance first, then Yahoo if fails."""
+    # 1. Try Binance
+    df = fetch_binance_data(binance_symbol, interval, limit)
+    if not df.empty:
+        return df
+    
+    # 2. Binance failed — use Yahoo
+    print(f"  🔄 Binance failed, switching to Yahoo for {ticker} ({interval})")
+    return fetch_yahoo_fallback(yahoo_ticker, interval, yahoo_days)
+
+def fetch_multiple_with_fallback(tickers_config: List[Tuple[str, str, str]], 
+                                  interval: str, limit: int, yahoo_days: int) -> Dict[str, pd.DataFrame]:
+    """Fetch multiple tickers with fallback logic."""
+    results = {}
+    for ticker, binance_sym, yahoo_sym in tickers_config:
+        df = fetch_with_fallback(ticker, binance_sym, yahoo_sym, interval, limit, yahoo_days)
+        if not df.empty and len(df) > 30:
+            results[ticker] = df
+            # Log data source
+            print(f"  ✅ {ticker} ({interval}): {len(df)} candles")
+        else:
+            print(f"  ⚠️ No usable data for {ticker} ({interval})")
+    return results
 
 # ============================================================
 # INDICATORS
@@ -203,73 +336,16 @@ def get_indicators(df: pd.DataFrame, bb_std: float = 2.0) -> pd.DataFrame:
     return df.dropna()
 
 # ============================================================
-# MULTI-TICKER FETCH
-# ============================================================
-def get_max_lookback(interval: str, requested_days: int) -> int:
-    total_days = requested_days + 30
-    if interval == '15m':
-        return min(total_days, 59)
-    elif interval in ['1h', '30m']:
-        return min(total_days, 730)
-    elif interval in ['4h', '1d', '5d']:
-        return min(total_days, 3650)
-    else:
-        return min(total_days, 730)
-
-def fetch_multiple_tickers(tickers: List[str], interval: str, lookback_days: int) -> Dict[str, pd.DataFrame]:
-    try:
-        end = datetime.now()
-        actual_days = get_max_lookback(interval, lookback_days)
-        start = end - timedelta(days=actual_days)
-        print(f"  📥 {interval}: requesting {actual_days} days")
-        data = yf.download(
-            tickers, 
-            start=start, 
-            end=end, 
-            interval=interval, 
-            progress=False, 
-            group_by='ticker',
-            auto_adjust=True,
-            threads=True,
-        )
-        results = {}
-        for ticker in tickers:
-            if ticker in data:
-                df = data[ticker]
-                if not df.empty and len(df) > 30:
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.droplevel(1)
-                    col_map = {}
-                    for c in df.columns:
-                        lc = c.lower()
-                        if 'open' in lc: col_map[c] = 'Open'
-                        elif 'high' in lc: col_map[c] = 'High'
-                        elif 'low' in lc: col_map[c] = 'Low'
-                        elif 'close' in lc: col_map[c] = 'Close'
-                        elif 'vol' in lc: col_map[c] = 'Volume'
-                    df.rename(columns=col_map, inplace=True)
-                    results[ticker] = df
-                else:
-                    print(f"  ⚠️ Insufficient data {ticker} ({interval}) — {len(df)} candles")
-            else:
-                print(f"  ⚠️ {ticker} not in response ({interval})")
-        return results
-    except Exception as e:
-        print(f"❌ Multi-fetch failed ({interval}): {e}")
-        return {}
-
-# ============================================================
 # LIQUIDITY & BTC FILTERS
 # ============================================================
 def check_liquidity(df: pd.DataFrame, ticker: str) -> bool:
-    avg = (df['Close'].tail(20) * df['Volume'].tail(20)).mean()
-    if avg < MIN_AVG_VOLUME_USD:
-        print(f"🚫 Liquidity fail {ticker}: ${avg:,.0f}")
+    avg_vol_usd = (df['Close'].tail(20) * df['Volume'].tail(20)).mean()
+    if avg_vol_usd < MIN_AVG_VOLUME_USD:
+        print(f"🚫 Liquidity fail {ticker}: ${avg_vol_usd:,.0f}")
         return False
     return True
 
 def get_btc_structure_from_df(df: pd.DataFrame) -> Optional[Dict]:
-    """Get BTC structure for DISPLAY purposes only — NOT used to block."""
     if df.empty or len(df) < 5:
         return None
     df = get_indicators(df, bb_std=2.0)
@@ -282,23 +358,6 @@ def get_btc_structure_from_df(df: pd.DataFrame) -> Optional[Dict]:
     n = sum([c1, c2, c3])
     bullish = (n >= 2)
     return {'bullish': bullish, 'score': f"{n}/3"}
-
-# ============================================================
-# FUNDING RATE
-# ============================================================
-def fetch_funding_rate(symbol: str) -> Optional[float]:
-    if not COINGLASS_API_KEY:
-        return None
-    try:
-        url = f"https://open-api.coinglass.com/public/v2/funding?symbol={symbol}&timeType=h8"
-        resp = requests.get(url, headers={"coinglassSecret": COINGLASS_API_KEY}, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('data'):
-                return float(data['data'][0].get('rate', 0))
-    except Exception:
-        pass
-    return None
 
 # ============================================================
 # TELEGRAM
@@ -481,8 +540,7 @@ def score_to_label(score: int) -> str:
     return 'LOW'
 
 def calculate_confidence(df: pd.DataFrame, levels: Dict, signal: Dict,
-                         btc_ctx: Dict, funding_rate: Optional[float],
-                         tf_alignment: str) -> Tuple[str, List[str], List[str]]:
+                         btc_ctx: Dict, tf_alignment: str) -> Tuple[str, List[str], List[str]]:
     confirmations: List[str] = []
     warnings: List[str] = []
     score = 0
@@ -520,16 +578,11 @@ def calculate_confidence(df: pd.DataFrame, levels: Dict, signal: Dict,
     else:
         warnings.append("No Fib confluence")
 
-    # ─── BTC IS NOW JUST A BONUS, NOT A BLOCKER ───
     if btc_ctx and btc_ctx['bullish']:
         confirmations.append(f"BTC bullish ({btc_ctx['score']}) ✅")
         score += 1
     else:
-        warnings.append(f"BTC not bullish ({btc_ctx['score'] if btc_ctx else 'N/A'}) — but scanning anyway")
-
-    if funding_rate is not None and funding_rate < 0:
-        confirmations.append(f"Funding {funding_rate:.4f}% — shorts paying ✅")
-        score += 1
+        warnings.append(f"BTC not bullish ({btc_ctx['score'] if btc_ctx else 'N/A'}) — info only")
 
     rr = levels['moderate']['rr']
     if rr >= 2.0:
@@ -570,23 +623,23 @@ def build_alert(signal_obj: Signal, tfs: Dict) -> str:
 
     confs = "\n".join([f"  ✅ {c}" for c in signal_obj.confirmations]) or "  —"
     warns = "\n".join([f"  ⚠️ {w}" for w in signal_obj.warnings]) or "  ✅ None"
-    funding_line = f"\n• Funding Rate : {signal_obj.funding_rate:.4f}%" if signal_obj.funding_rate is not None else ""
     fib_line = f"\n• Fib 38.2%    : {signal_obj.fib_382:.4f}  |  50%: {signal_obj.fib_50:.4f}" if signal_obj.fib_confluence else ""
 
     return f"""
 🟢 <b>BBMA BUY SETUP</b> {emoji} <b>{signal_obj.confidence}</b>
 
-📊 <b>{signal_obj.pair}</b>  |  {signal_obj.style}  ({tfs['big']}→{tfs['mid']}→{tfs['small']})
+📊 <b>{signal_obj.display_name}</b>  |  {signal_obj.style}  ({tfs['big']}→{tfs['mid']}→{tfs['small']})
 🎯 Pattern : Re-Entry Buy ({csa_label})
 ⏰ Time    : {signal_obj.timestamp}
 🧩 Alignment: {signal_obj.tf_alignment}
+📡 Data Source: {signal_obj.data_source}
 
 ━━━━━━━━━━━━━━━━━━━━
 
 🌐 <b>MARKET CONTEXT</b>
-• BTC Structure : {signal_obj.btc_score} (INFO only — not a blocker)
+• BTC Structure : {signal_obj.btc_score} (INFO only)
 • BB Expanding  : {"✅ Yes" if signal_obj.bb_expanding else "❌ No"}
-• ATR (Vol)     : {signal_obj.atr:.4f}  ({signal_obj.atr / signal_obj.entry_moderate * 100:.1f}%){funding_line}{fib_line}
+• ATR (Vol)     : {signal_obj.atr:.4f}  ({signal_obj.atr / signal_obj.entry_moderate * 100:.1f}%){fib_line}
 
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -627,9 +680,9 @@ def build_alert(signal_obj: Signal, tfs: Dict) -> str:
 def scan_single_pair_with_dfs(ticker: str, pair_cfg: Dict, cache: Dict,
                               df_big: pd.DataFrame, df_mid: pd.DataFrame,
                               df_small: pd.DataFrame, btc_ctx: Dict,
-                              tfs: Dict, style: str, fib_lookback: int):
-    """Scan a single pair using pre-fetched dataframes."""
+                              tfs: Dict, style: str, fib_lookback: int, data_source: str):
     bb_std = pair_cfg.get('bb_std', 2.0)
+    display_name = pair_cfg.get('display', ticker)
 
     try:
         if is_duplicate(cache, ticker, style):
@@ -687,12 +740,9 @@ def scan_single_pair_with_dfs(ticker: str, pair_cfg: Dict, cache: Dict,
             print(f"  ⏭️  {ticker} R/R {levels['moderate']['rr']:.1f}× < {MIN_RR}×")
             return
 
-        symbol = ticker.replace('-USD', '')
-        funding_rate = fetch_funding_rate(symbol)
         tf_label = "R-E-M"
-
         confidence, confs, warns = calculate_confidence(
-            df_small, levels, setup_found, btc_ctx, funding_rate, tf_label
+            df_small, levels, setup_found, btc_ctx, tf_label
         )
 
         CONF_ORDER = ['LOW', 'MEDIUM', 'HIGH', 'PERFECT']
@@ -700,9 +750,9 @@ def scan_single_pair_with_dfs(ticker: str, pair_cfg: Dict, cache: Dict,
             print(f"  ⏭️  {ticker} Confidence {confidence} below {MIN_CONFIDENCE}")
             return
 
-        pair_name = ticker.replace('-USD', '/USDT')
         sig = Signal(
-            pair=pair_name,
+            pair=ticker,
+            display_name=display_name,
             style=style,
             entry_zone_top=levels['zone_top'],
             entry_zone_bottom=levels['zone_bottom'],
@@ -723,33 +773,33 @@ def scan_single_pair_with_dfs(ticker: str, pair_cfg: Dict, cache: Dict,
             fib_confluence=levels['fib_confluence'],
             csa_type=setup_found.get('csa_type', 'CSA_EARLY'),
             btc_score=btc_ctx['score'] if btc_ctx else 'N/A',
-            funding_rate=funding_rate,
             timestamp=datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
             bb_expanding=levels['bb_expanding'],
             tf_alignment=tf_label,
+            data_source=data_source,
         )
 
         msg = build_alert(sig, tfs)
         send_telegram(msg)
         mark_sent(cache, ticker, style)
-        print(f"  🚨 ALERT: {pair_name} @ {current_price:.4f} | {confidence}")
+        print(f"  🚨 ALERT: {display_name} @ {current_price:.4f} | {confidence}")
 
     except Exception as e:
         print(f"  ❌ Error scanning {ticker}: {e}")
         traceback.print_exc()
 
 # ============================================================
-# MAIN — NO BTC BLOCKER, ONLY RENDER
+# MAIN
 # ============================================================
 def main():
     print(f"\n{'='*50}")
-    print(f"  BBMA 9.9 SPOT SCANNER (RENDER-USD ONLY)")
+    print(f"  BBMA SCANNER (Binance + Yahoo Fallback)")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Pairs: {len(PAIRS)} | Styles: {', '.join(STYLES)}")
-    print(f"  BTC Filter: DISABLED as blocker (INFO only)")
+    print(f"  BTC Filter: DISABLED (INFO only)")
     print(f"  Min Liquidity: ${MIN_AVG_VOLUME_USD:,.0f}")
     print(f"  Cooldown: {ALERT_COOLDOWN_HOURS}h | Min R/R: {MIN_RR}×")
-    print(f"  Min Confidence: {MIN_CONFIDENCE} | DRY RUN: {DRY_RUN}")
+    print(f"  DRY RUN: {DRY_RUN}")
     print(f"{'='*50}")
 
     cache = load_cache()
@@ -762,35 +812,52 @@ def main():
         print(f"  STYLE: {style} ({tfs['big']}→{tfs['mid']}→{tfs['small']})")
         print(f"{'─'*45}")
 
-        days = tfs['lookback_days']
+        limit = tfs.get('binance_limit', 500)
+        yahoo_days = tfs.get('yahoo_days', 30)
         fib_lookback = tfs['fib_lookback']
 
-        print(f"  📡 Fetching {len(tickers)} tickers on {tfs['big']}...")
-        big_data = fetch_multiple_tickers(tickers, tfs['big'], days)
+        # Build fetch configs: (ticker_key, binance_symbol, yahoo_ticker)
+        fetch_configs = []
+        for ticker, cfg in PAIRS.items():
+            yahoo_ticker = cfg.get('yahoo_ticker', ticker.replace('USDT', '-USD'))
+            fetch_configs.append((ticker, ticker, yahoo_ticker))
+
+        # ── Big TF ──────────────────────────────────────────────
+        print(f"  📡 Fetching {len(fetch_configs)} tickers on {tfs['big']}...")
+        big_data = fetch_multiple_with_fallback(fetch_configs, tfs['big'], limit, yahoo_days)
         if not big_data:
             print("  ⚠️ Big TF fetch failed, skipping style")
             continue
 
-        print(f"  📡 Fetching {len(tickers)} tickers on {tfs['mid']}...")
-        mid_data = fetch_multiple_tickers(tickers, tfs['mid'], days)
+        # ── Mid TF ──────────────────────────────────────────────
+        print(f"  📡 Fetching {len(fetch_configs)} tickers on {tfs['mid']}...")
+        mid_data = fetch_multiple_with_fallback(fetch_configs, tfs['mid'], limit, yahoo_days)
         if not mid_data:
             print("  ⚠️ Mid TF fetch failed, skipping style")
             continue
 
-        print(f"  📡 Fetching {len(tickers)} tickers on {tfs['small']}...")
-        small_data = fetch_multiple_tickers(tickers, tfs['small'], days)
+        # ── Small TF ─────────────────────────────────────────────
+        print(f"  📡 Fetching {len(fetch_configs)} tickers on {tfs['small']}...")
+        small_data = fetch_multiple_with_fallback(fetch_configs, tfs['small'], limit, yahoo_days)
         if not small_data:
             print("  ⚠️ Small TF fetch failed, skipping style")
             continue
 
-        # ─── BTC CONTEXT — DISPLAY ONLY, NO BLOCK ───
-        btc_df = big_data.get('BTC-USD')
-        btc_ctx = get_btc_structure_from_df(btc_df) if btc_df is not None else None
-        if btc_ctx is None:
-            print("  📊 BTC data unavailable — scanning RENDER anyway")
+        # ── BTC Context (for info only) ─────────────────────────
+        # Try to get BTCUSDT from Binance or fallback to Yahoo
+        btc_df = fetch_with_fallback('BTCUSDT', 'BTCUSDT', 'BTC-USD', tfs['big'], limit, yahoo_days)
+        if not btc_df.empty:
+            btc_ctx = get_btc_structure_from_df(btc_df)
+            print(f"  📊 BTC Structure: {btc_ctx['score'] if btc_ctx else 'N/A'} — SCANNING RENDER REGARDLESS")
         else:
-            print(f"  📊 BTC Structure: {btc_ctx['score']} ({'Bullish' if btc_ctx['bullish'] else 'Bearish'}) — SCANNING RENDER REGARDLESS")
+            print("  📊 BTC data unavailable — scanning RENDER anyway")
 
+        # Determine data source for display
+        # Check one ticker to see if source is Binance or Yahoo
+        sample_key = list(big_data.keys())[0] if big_data else None
+        data_source = 'Binance' if sample_key and sample_key in big_data and len(big_data[sample_key]) > 50 else 'Yahoo'
+        
+        # ── Scan ──────────────────────────────────────────────────
         for ticker, cfg in PAIRS.items():
             df_big = big_data.get(ticker)
             df_mid = mid_data.get(ticker)
@@ -803,7 +870,7 @@ def main():
             scan_single_pair_with_dfs(
                 ticker, cfg, cache,
                 df_big, df_mid, df_small,
-                btc_ctx, tfs, style, fib_lookback
+                btc_ctx, tfs, style, fib_lookback, data_source
             )
 
         style_keys = [k for k in cache.keys() if k.endswith(f"_{style}")]
@@ -817,8 +884,9 @@ def main():
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
 📊 Coins scanned: {len(PAIRS)}
 📈 Alerts sent (last hour): {alert_count}
-🟢 BTC Structure: {btc_ctx['score'] if btc_ctx else 'N/A'} ({'Bullish' if btc_ctx and btc_ctx['bullish'] else 'Bearish'}) — FOR INFO ONLY
-✅ Status: Running (Focused on RENDER-USD only)
+🟢 BTC Structure: {btc_ctx['score'] if btc_ctx else 'N/A'} — FOR INFO ONLY
+📡 Primary: Binance (auto-fallback to Yahoo)
+✅ Status: Running
 """
         send_telegram(heartbeat)
 
