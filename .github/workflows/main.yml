@@ -2,35 +2,45 @@ name: BTC EMA Crossover Alert Bot
 
 on:
   schedule:
-    # Run every day at 00:05 UTC (after market close)
+    # Run every day at 00:05 UTC
     - cron: '5 0 * * *'
-  workflow_dispatch:  # Allow manual trigger from phone
+  workflow_dispatch:
 
 jobs:
   alert-bot:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
+      
+      - name: Cache bot state
+        uses: actions/cache@v4
+        with:
+          path: bot_state.json
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+      
       - name: Install dependencies
         run: |
           pip install yfinance pandas numpy requests
-
+      
       - name: Run BTC EMA Alert Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python btc_ema_bot.py
-
-      - name: Save bot state
-        uses: stefanzweifel/git-auto-commit-action@v5
+      
+      - name: Upload state as artifact
+        uses: actions/upload-artifact@v4
         with:
-          commit_message: "Update bot state - EMA crossover check"
-          file_pattern: bot_state.json
+          name: bot-state
+          path: bot_state.json
+          retention-days: 30
