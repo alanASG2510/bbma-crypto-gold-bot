@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC EMA Crossover Alert Bot v4.0 - FINAL (FIXED: daily close signal + string escaping)
+BTC EMA Crossover Alert Bot v4.0 - FINAL (FIXED: daily close signal + relaxed token validation)
 Ralph Loop Iteration 3: Security + Documentation + Multi-Asset
 
 **PENTING**: Signal dijana berdasarkan harga penutup HARIAN YANG SUDAH SAH (bar semalam).
@@ -47,13 +47,13 @@ HEALTH_REPORT_INTERVAL = int(os.environ.get("HEALTH_INTERVAL", "7"))  # every N 
 # SECURITY: Validate secrets without exposing them
 # ============================================================
 def validate_secrets() -> Tuple[bool, str]:
-    """Validate secrets exist and look valid without logging them"""
+    """Validate secrets exist and have minimal format (non-empty, contains ':')"""
     errors = []
 
     if not TELEGRAM_BOT_TOKEN:
         errors.append("TELEGRAM_BOT_TOKEN not set")
-    elif not TELEGRAM_BOT_TOKEN.replace(":", "").isalnum():
-        errors.append("TELEGRAM_BOT_TOKEN format invalid")
+    elif ":" not in TELEGRAM_BOT_TOKEN:
+        errors.append("TELEGRAM_BOT_TOKEN missing ':' (not a valid bot token)")
 
     if not TELEGRAM_CHAT_ID:
         errors.append("TELEGRAM_CHAT_ID not set")
@@ -64,7 +64,7 @@ def validate_secrets() -> Tuple[bool, str]:
             errors.append("TELEGRAM_CHAT_ID must be numeric")
 
     if len(errors) == 0:
-        # Log hash of token for debugging without exposing it
+        # Log partial token hash for debugging
         token_hash = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).hexdigest()[:8]
         return True, f"Secrets validated (token hash: {token_hash}...)"
 
