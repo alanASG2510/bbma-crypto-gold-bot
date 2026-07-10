@@ -171,40 +171,17 @@ def send_startup_notification():
 
 def send_heartbeat(result: Dict[str, Any], state: Dict[str, Any]):
     """Send daily heartbeat — bot is alive, no signal today"""
-    run_count = state.get("run_count", 0)
-    last_signal = state.get("last_signal", "None")
-    last_signal_date = "N/A"
-
+    last_signal = state.get("last_signal", "-")
+    last_date = "-"
     if state.get("signal_history"):
-        last_entry = state["signal_history"][-1]
-        last_signal_date = last_entry.get("date", "N/A")
-
-    current_price = result["price"]
-    current_rsi = result["rsi"]
-    trend = result["trend"]
-    trend_emoji = "🐂" if trend == "BULLISH" else "🐻"
-
-    # Calculate days since last signal
-    days_since_signal = "N/A"
-    if last_signal_date != "N/A":
-        try:
-            last_dt = datetime.strptime(last_signal_date, "%Y-%m-%d")
-            days_since_signal = (datetime.now() - last_dt).days
-        except:
-            pass
+        last_date = state["signal_history"][-1].get("date", "-")
 
     message = (
-        f"💓 *DAILY HEARTBEAT — Bot is Alive!*\n\n"
-        f"📊 Asset: {TICKER}\n"
-        f"💰 Current Price: `${current_price:,.2f}`\n"
-        f"📊 RSI({RSI_PERIOD}): `{current_rsi:.2f}`\n"
-        f"{trend_emoji} Trend: {trend}\n\n"
-        f"📡 Last Signal: {last_signal} ({last_signal_date})\n"
-        f"⏳ Days Since Last Signal: {days_since_signal}\n"
-        f"🔢 Total Runs: {run_count}\n\n"
-        f"✅ *Status:* No signal today. Bot is healthy and monitoring.\n"
-        f"⏰ Next Check: Tomorrow 00:05 UTC\n\n"
-        f"🤖 Bot v5.1 | RSI Mean Reversion | Ralph Loop Verified"
+        f"💓 *{TICKER} | No Signal | ${result['price']:,.2f}*\n\n"
+        f"📊 RSI: `{result['rsi']:.1f}` | {result['trend']}\n"
+        f"📡 Last: {last_signal} ({last_date})\n"
+        f"🔢 Runs: {state.get('run_count', 0)}\n\n"
+        f"✅ Bot healthy. Monitoring..."
     )
     send_telegram_message(message)
 
@@ -461,10 +438,10 @@ def check_signal(df: pd.DataFrame) -> Dict[str, Any]:
 def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
     signal = result["signal"]
     emoji = "🟢" if signal == "BUY" else "🔴"
-    action = "BELI / BUY" if signal == "BUY" else "JUAL / SELL"
-    confidence_emoji = "💪" if result["confidence"] == "high" else "⚡" if result["confidence"] == "medium" else "⚠️"
+    action = "BELI" if signal == "BUY" else "JUAL"
 
-    position_info = ""
+    # P&L for SELL signals
+    pnl_line = ""
     if signal == "SELL" and state.get("signal_history"):
         last_entry = None
         for h in reversed(state["signal_history"]):
@@ -472,70 +449,17 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
                 last_entry = h
                 break
         if last_entry:
-            entry_price = last_entry["price"]
-            pnl = ((result["price"] - entry_price) / entry_price) * 100
+            pnl = ((result["price"] - last_entry["price"]) / last_entry["price"]) * 100
             pnl_emoji = "🟢" if pnl > 0 else "🔴"
-            days_held = "N/A"
-            try:
-                entry_date = datetime.fromisoformat(last_entry["time"])
-                days_held = (datetime.now() - entry_date).days
-            except:
-                pass
-            position_info = (
-                f"\n📊 *Trade Performance:*\n"
-                f"   Entry: ${entry_price:,.2f}\n"
-                f"   Exit: ${result['price']:,.2f}\n"
-                f"   P&L: {pnl_emoji} {pnl:+.2f}%\n"
-                f"   Days Held: {days_held}"
-            )
-
-    confirmation = ""
-    tf_data = get_4h_confirmation()
-    if tf_data and tf_data.get("aligned"):
-        rsi_4h = tf_data.get("rsi_4h", 0)
-        if signal == "BUY" and rsi_4h < 35:
-            confirmation = "\n✅ *4H Confirmation:* RSI aligned oversold"
-        elif signal == "SELL" and rsi_4h > 65:
-            confirmation = "\n✅ *4H Confirmation:* RSI aligned overbought"
-        else:
-            confirmation = "\n⚠️ *4H Confirmation:* Mixed signals"
-
-    levels = (
-        f"\n📍 *Key Levels:*\n"
-        f"   Support: ${result['support']:,.2f}\n"
-        f"   Resistance: ${result['resistance']:,.2f}\n"
-        f"   SMA20: ${result['sma_20']:,.2f}"
-    )
-
-    trend_emoji = "🐂" if result["trend"] == "BULLISH" else "🐻"
-    action_text = "🚀 MASUK POSITION BELI SEKARANG!" if signal == "BUY" else "🔒 KELUAR POSITION JUAL SEKARANG!"
+            pnl_line = f"\n📊 P&L: {pnl_emoji} {pnl:+.2f}%"
 
     message = (
-        f"{emoji} {emoji} {emoji} *{TICKER} RSI MEAN REVERSION ALERT* {emoji} {emoji} {emoji}\n\n"
-        f"🏆 *RALPH LOOP WINNER STRATEGY*\n"
-        f"📈 Backtest: $25 → $1,860 (7,340% growth)\n"
-        f"📊 Sharpe: 6.94 | Win Rate: 84.9% | Max DD: 21.3%\n\n"
-        f"{confidence_emoji} *Signal:* {action}\n"
-        f"{confidence_emoji} *Confidence:* {result['confidence'].upper()}\n"
-        f"{trend_emoji} *Trend:* {result['trend']}\n\n"
-        f"📊 *RSI({RSI_PERIOD}):* `{result['rsi']:.2f}`\n"
-        f"📊 *Previous RSI:* `{result['prev_rsi']:.2f}`\n"
-        f"📊 *Intraday RSI:* `{result['curr_rsi']:.2f}` (not for signal)\n\n"
-        f"💰 *Price (Daily Close):* `${result['price']:,.2f}`\n"
-        f"📈 *Change from prev close:* {result['price_change_pct']:+.2f}%\n"
-        f"📅 *Candle Date:* {result['date'][:10]}"
-        f"{levels}"
-        f"{confirmation}"
-        f"{position_info}\n\n"
-        f"💡 *Action:* {action_text}\n\n"
-        f"📋 *Rules:*\n"
-        f"   • BUY when RSI < {RSI_OVERSOLD:.0f}\n"
-        f"   • SELL when RSI > {RSI_OVERBOUGHT:.0f}\n"
-        f"   • Spot only — no leverage\n"
-        f"   • All-in position sizing\n\n"
-        f"⚠️ *Disclaimer:* Bukan nasihat kewangan. Risiko tanggung sendiri.\n\n"
-        f"⏰ Signal based on CONFIRMED DAILY CLOSE\n"
-        f"🤖 Bot v5.1 | RSI Mean Reversion | Ralph Loop Verified"
+        f"{emoji} *{TICKER} | {action} | ${result['price']:,.2f}* {emoji}\n\n"
+        f"📊 RSI({RSI_PERIOD}): `{result['rsi']:.1f}` | Prev: `{result['prev_rsi']:.1f}`\n"
+        f"📅 {result['date'][:10]} | {result['trend']}\n"
+        f"💪 Confidence: {result['confidence'].upper()}{pnl_line}\n\n"
+        f"📍 S: ${result['support']:,.0f} | R: ${result['resistance']:,.0f}\n\n"
+        f"{'🚀 BELI SEKARANG!' if signal == 'BUY' else '🔒 JUAL SEKARANG!'}"
     )
     return message
 
