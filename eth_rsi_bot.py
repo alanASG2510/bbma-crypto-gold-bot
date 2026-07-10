@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-ETH RSI(14) Mean Reversion Alert Bot v5.0 — RALPH LOOP CHAMPION
+ETH RSI(14) Mean Reversion Alert Bot v5.1 — RALPH LOOP CHAMPION
 ================================================================
 Strategy Winner: RSI(14) Mean Reversion on ETH
 Backtest: $25 → $1,860 (7,340% return) | Sharpe 6.94 | Win Rate 84.9%
 Verified: Ralph Loop backtest on BTC & ETH 2025 hourly data
 
+DAILY HEARTBEAT FEATURE:
+  - Every day bot sends "heartbeat" message to confirm it's alive
+  - If there's a trading signal, heartbeat is skipped (signal takes priority)
+  - You always know the bot is functioning without checking GitHub
+
 RULES:
-  BUY:  RSI(14) < 30 (oversold) AND RSI was ≥ 30 on previous candle
-  SELL: RSI(14) > 70 (overbought) AND RSI was ≤ 70 on previous candle
+  BUY:  RSI(14) < 30 (oversold) AND RSI was >= 30 on previous candle
+  SELL: RSI(14) > 70 (overbought) AND RSI was <= 70 on previous candle
   SPOT ONLY — All-in position sizing optimized for small accounts ($25+)
 
 SIGNAL DIJANA BERDASARKAN HARGA PENUTUP HARIAN YANG SUDAH SAH (DAILY CLOSE).
@@ -16,6 +21,8 @@ Bot hanya patut dijalankan SEKALI SEHARI selepas candle harian selesai.
 
 Features:
 - RSI(14) mean reversion with confirmed daily close
+- Daily heartbeat alert (bot alive confirmation)
+- Signal alert takes priority over heartbeat
 - Multi-timeframe validation (Daily primary, 4H confirmation)
 - P&L tracking with win rate calculation
 - Drawdown monitoring
@@ -156,7 +163,48 @@ def send_startup_notification():
         f"🎯 Exit: RSI > {RSI_OVERBOUGHT:.0f} (Overbought)\n"
         f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
         "📈 Backtest: $25 → $1,860 (7,340% growth) | Sharpe 6.94 | Win Rate 84.9%\n"
-        "✅ Verified on BTC & ETH 2025 data via Ralph Loop"
+        "✅ Verified on BTC & ETH 2025 data via Ralph Loop\n\n"
+        "💓 *Daily Heartbeat:* You'll get a daily status update.\n"
+        "🚨 *Signal Alert:* If there's a signal, heartbeat is skipped."
+    )
+    send_telegram_message(message)
+
+def send_heartbeat(result: Dict[str, Any], state: Dict[str, Any]):
+    """Send daily heartbeat — bot is alive, no signal today"""
+    run_count = state.get("run_count", 0)
+    last_signal = state.get("last_signal", "None")
+    last_signal_date = "N/A"
+
+    if state.get("signal_history"):
+        last_entry = state["signal_history"][-1]
+        last_signal_date = last_entry.get("date", "N/A")
+
+    current_price = result["price"]
+    current_rsi = result["rsi"]
+    trend = result["trend"]
+    trend_emoji = "🐂" if trend == "BULLISH" else "🐻"
+
+    # Calculate days since last signal
+    days_since_signal = "N/A"
+    if last_signal_date != "N/A":
+        try:
+            last_dt = datetime.strptime(last_signal_date, "%Y-%m-%d")
+            days_since_signal = (datetime.now() - last_dt).days
+        except:
+            pass
+
+    message = (
+        f"💓 *DAILY HEARTBEAT — Bot is Alive!*\n\n"
+        f"📊 Asset: {TICKER}\n"
+        f"💰 Current Price: `${current_price:,.2f}`\n"
+        f"📊 RSI({RSI_PERIOD}): `{current_rsi:.2f}`\n"
+        f"{trend_emoji} Trend: {trend}\n\n"
+        f"📡 Last Signal: {last_signal} ({last_signal_date})\n"
+        f"⏳ Days Since Last Signal: {days_since_signal}\n"
+        f"🔢 Total Runs: {run_count}\n\n"
+        f"✅ *Status:* No signal today. Bot is healthy and monitoring.\n"
+        f"⏰ Next Check: Tomorrow 00:05 UTC\n\n"
+        f"🤖 Bot v5.1 | RSI Mean Reversion | Ralph Loop Verified"
     )
     send_telegram_message(message)
 
@@ -227,14 +275,15 @@ def load_state() -> Dict[str, Any]:
         "signal_history": [],
         "error_count": 0,
         "run_count": 0,
-        "version": "5.0",
+        "version": "5.1",
         "first_run": datetime.now().isoformat(),
         "data_hash": None,
         "asset": TICKER,
         "max_drawdown_pct": 0,
         "peak_equity": 25.0,
         "current_equity": 25.0,
-        "strategy": "RSI14_MeanReversion"
+        "strategy": "RSI14_MeanReversion",
+        "heartbeat_sent_today": False
     }
     if not os.path.exists(STATE_FILE):
         logger.info("No state file found, creating new state")
@@ -319,7 +368,6 @@ def get_eth_data() -> Optional[pd.DataFrame]:
     return None
 
 def get_4h_confirmation() -> Optional[Dict[str, Any]]:
-    """Fetch 4H data for multi-timeframe confirmation"""
     try:
         ticker = yf.Ticker(TICKER)
         df_4h = ticker.history(period="30d", interval="4h")
@@ -351,17 +399,11 @@ def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 def check_signal(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Generate RSI(14) Mean Reversion signal based on LAST COMPLETED daily candle (index -2).
-    BUY:  RSI < 30 AND previous RSI >= 30
-    SELL: RSI > 70 AND previous RSI <= 70
-    """
     df["rsi"] = calculate_rsi(df["close"], RSI_PERIOD)
 
-    # Use yesterday's confirmed close (index -2)
     prev_rsi = df["rsi"].iloc[-2]
     prev2_rsi = df["rsi"].iloc[-3]
-    curr_rsi = df["rsi"].iloc[-1]  # intraday, not for signal
+    curr_rsi = df["rsi"].iloc[-1]
 
     curr_price = df["close"].iloc[-2]
     prev_price = df["close"].iloc[-3]
@@ -370,7 +412,6 @@ def check_signal(df: pd.DataFrame) -> Dict[str, Any]:
     signal = None
     confidence = "low"
 
-    # BUY: RSI crossed below 30 (oversold entry)
     if prev2_rsi >= RSI_OVERSOLD and prev_rsi < RSI_OVERSOLD:
         signal = "BUY"
         gap = RSI_OVERSOLD - prev_rsi
@@ -378,8 +419,6 @@ def check_signal(df: pd.DataFrame) -> Dict[str, Any]:
             confidence = "high"
         elif gap > 2:
             confidence = "medium"
-
-    # SELL: RSI crossed above 70 (overbought exit)
     elif prev2_rsi <= RSI_OVERBOUGHT and prev_rsi > RSI_OVERBOUGHT:
         signal = "SELL"
         gap = prev_rsi - RSI_OVERBOUGHT
@@ -388,15 +427,12 @@ def check_signal(df: pd.DataFrame) -> Dict[str, Any]:
         elif gap > 2:
             confidence = "medium"
 
-    # Near threshold warning
     near_oversold = prev_rsi < RSI_OVERSOLD + 5 and prev_rsi >= RSI_OVERSOLD
     near_overbought = prev_rsi > RSI_OVERBOUGHT - 5 and prev_rsi <= RSI_OVERBOUGHT
 
-    # Support/Resistance from 20 completed bars
     recent_lows = df['low'].iloc[-22:-1].min()
     recent_highs = df['high'].iloc[-22:-1].max()
 
-    # Trend context
     sma_20 = df['close'].iloc[-22:-1].mean()
     trend = "BULLISH" if curr_price > sma_20 else "BEARISH"
 
@@ -428,7 +464,6 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
     action = "BELI / BUY" if signal == "BUY" else "JUAL / SELL"
     confidence_emoji = "💪" if result["confidence"] == "high" else "⚡" if result["confidence"] == "medium" else "⚠️"
 
-    # P&L calculation for SELL signals
     position_info = ""
     if signal == "SELL" and state.get("signal_history"):
         last_entry = None
@@ -454,7 +489,6 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
                 f"   Days Held: {days_held}"
             )
 
-    # Multi-timeframe confirmation
     confirmation = ""
     tf_data = get_4h_confirmation()
     if tf_data and tf_data.get("aligned"):
@@ -466,7 +500,6 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
         else:
             confirmation = "\n⚠️ *4H Confirmation:* Mixed signals"
 
-    # Key levels
     levels = (
         f"\n📍 *Key Levels:*\n"
         f"   Support: ${result['support']:,.2f}\n"
@@ -474,9 +507,7 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
         f"   SMA20: ${result['sma_20']:,.2f}"
     )
 
-    # Trend context
     trend_emoji = "🐂" if result["trend"] == "BULLISH" else "🐻"
-
     action_text = "🚀 MASUK POSITION BELI SEKARANG!" if signal == "BUY" else "🔒 KELUAR POSITION JUAL SEKARANG!"
 
     message = (
@@ -504,7 +535,7 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
         f"   • All-in position sizing\n\n"
         f"⚠️ *Disclaimer:* Bukan nasihat kewangan. Risiko tanggung sendiri.\n\n"
         f"⏰ Signal based on CONFIRMED DAILY CLOSE\n"
-        f"🤖 Bot v5.0 | RSI Mean Reversion | Ralph Loop Verified"
+        f"🤖 Bot v5.1 | RSI Mean Reversion | Ralph Loop Verified"
     )
     return message
 
@@ -513,7 +544,7 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any]) -> str:
 # ============================================================
 def main():
     logger.info("=" * 70)
-    logger.info("🤖 ETH RSI(14) MEAN REVERSION BOT v5.0 — RALPH LOOP CHAMPION")
+    logger.info("🤖 ETH RSI(14) MEAN REVERSION BOT v5.1 — RALPH LOOP CHAMPION")
     logger.info("=" * 70)
     logger.info(f"Strategy: RSI({RSI_PERIOD}) Mean Reversion on DAILY CLOSE")
     logger.info(f"Asset: {TICKER}")
@@ -559,58 +590,59 @@ def main():
         if result["near_overbought"] and not current_signal:
             logger.warn("⚠️ RSI near overbought zone — potential SELL incoming!")
 
-        should_alert = False
+        signal_sent = False
 
+        # PRIORITY 1: Send SIGNAL alert if there's a signal
         if current_signal is not None:
             if current_signal != state.get("last_signal"):
-                should_alert = True
                 logger.info(f"🚨 NEW {current_signal} SIGNAL DETECTED!")
+                message = build_alert_message(result, state)
+                success = send_telegram_message(message)
+
+                if success:
+                    signal_sent = True
+                    state["last_signal"] = current_signal
+                    state["last_price"] = result["price"]
+
+                    if "signal_history" not in state:
+                        state["signal_history"] = []
+                    state["signal_history"].append({
+                        "signal": current_signal,
+                        "price": result["price"],
+                        "date": result["date"][:10],
+                        "confidence": result["confidence"],
+                        "rsi": result["rsi"],
+                        "trend": result["trend"],
+                        "time": datetime.now().isoformat()
+                    })
+                    state["signal_history"] = state["signal_history"][-50:]
+
+                    if current_signal == "SELL" and len(state["signal_history"]) >= 2:
+                        last_buy = None
+                        for h in reversed(state["signal_history"][:-1]):
+                            if h["signal"] == "BUY":
+                                last_buy = h
+                                break
+                        if last_buy:
+                            pnl = ((result["price"] - last_buy["price"]) / last_buy["price"])
+                            state["current_equity"] = state["current_equity"] * (1 + pnl)
+                            if state["current_equity"] > state["peak_equity"]:
+                                state["peak_equity"] = state["current_equity"]
+                            dd = (state["peak_equity"] - state["current_equity"]) / state["peak_equity"] * 100
+                            if dd > state["max_drawdown_pct"]:
+                                state["max_drawdown_pct"] = dd
+                else:
+                    logger.error("Failed to send signal alert — will retry next run")
+                    state["error_count"] = state.get("error_count", 0) + 1
             else:
                 logger.info(f"Signal unchanged ({current_signal}) — no alert")
         else:
-            logger.info("No RSI crossover yesterday — no alert")
+            logger.info("No RSI crossover yesterday — no signal")
 
-        if should_alert:
-            message = build_alert_message(result, state)
-            success = send_telegram_message(message)
-
-            if success:
-                state["last_signal"] = current_signal
-                state["last_price"] = result["price"]
-
-                if "signal_history" not in state:
-                    state["signal_history"] = []
-                state["signal_history"].append({
-                    "signal": current_signal,
-                    "price": result["price"],
-                    "date": result["date"][:10],
-                    "confidence": result["confidence"],
-                    "rsi": result["rsi"],
-                    "trend": result["trend"],
-                    "time": datetime.now().isoformat()
-                })
-                state["signal_history"] = state["signal_history"][-50:]
-
-                # Update equity tracking
-                if current_signal == "SELL" and len(state["signal_history"]) >= 2:
-                    # Find last buy
-                    last_buy = None
-                    for h in reversed(state["signal_history"][:-1]):
-                        if h["signal"] == "BUY":
-                            last_buy = h
-                            break
-                    if last_buy:
-                        pnl = ((result["price"] - last_buy["price"]) / last_buy["price"])
-                        state["current_equity"] = state["current_equity"] * (1 + pnl)
-                        # Track drawdown
-                        if state["current_equity"] > state["peak_equity"]:
-                            state["peak_equity"] = state["current_equity"]
-                        dd = (state["peak_equity"] - state["current_equity"]) / state["peak_equity"] * 100
-                        if dd > state["max_drawdown_pct"]:
-                            state["max_drawdown_pct"] = dd
-            else:
-                logger.error("Failed to send alert — will retry next run")
-                state["error_count"] = state.get("error_count", 0) + 1
+        # PRIORITY 2: Send HEARTBEAT if no signal was sent
+        if not signal_sent:
+            logger.info("💓 Sending daily heartbeat...")
+            send_heartbeat(result, state)
 
         state["error_count"] = 0
 
