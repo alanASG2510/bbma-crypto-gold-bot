@@ -1,4 +1,4 @@
-name: ETH RSI(14) Mean Reversion Alert Bot
+name: ETH RSI(14) Mean Reversion Alert Bot v6.0
 
 on:
   schedule:
@@ -31,9 +31,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas numpy requests
+          pip install yfinance pandas numpy requests ccxt
 
-      - name: Run ETH RSI(14) Mean Reversion Bot
+      - name: Run ETH RSI(14) Mean Reversion Bot v6.0
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -55,7 +55,9 @@ jobs:
         if: always()
         with:
           name: eth-rsi-state-${{ github.run_id }}
-          path: eth_rsi_bot_state.json
+          path: |
+            eth_rsi_bot_state.json
+            eth_rsi_bot.log
           retention-days: 30
 
       - name: Upload logs on failure
@@ -66,5 +68,5 @@ jobs:
           path: |
             eth_rsi_bot_state.json
             eth_rsi_bot_state.json.backup
+            eth_rsi_bot.log
           retention-days: 7
-
