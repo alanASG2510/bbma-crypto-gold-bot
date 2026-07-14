@@ -1,8 +1,8 @@
-name: ETH RSI(14) Mean Reversion Alert Bot v6.0
+name: ETH RSI(14) Mean Reversion Alert Bot v6.1
 
 on:
   schedule:
-    - cron: '5 0 * * *'
+    - cron: '5 */4 * * *'   # Jalan setiap 4 jam (12:05, 4:05, 8:05 pagi/petang)
   workflow_dispatch:
 
 env:
@@ -33,7 +33,7 @@ jobs:
         run: |
           pip install yfinance pandas numpy requests ccxt
 
-      - name: Run ETH RSI(14) Mean Reversion Bot v6.0
+      - name: Run ETH RSI(14) Mean Reversion Bot v6.1
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
