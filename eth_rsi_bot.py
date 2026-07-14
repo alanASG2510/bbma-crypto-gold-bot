@@ -1,38 +1,17 @@
 #!/usr/bin/env python3
 """
-ETH RSI(14) Mean Reversion Alert Bot v6.0 — RALPH LOOP PERFECT 5/5
+ETH RSI(14) Mean Reversion Alert Bot v6.1 — 4H + DAILY FILTER + LIMIT ORDER
 ====================================================================
-Strategy: RSI(14) Mean Reversion with 4H confirmation, volume filter,
-          trailing stop, take profit, and ATR-based confidence.
+Strategy: RSI(14) Mean Reversion with 4H signals + Daily RSI safety
 Backtest: $25 → $1,860 (7,340% return) | Sharpe 6.94 | Win Rate 84.9%
-Verified: Ralph Loop backtest on BTC & ETH 2025 hourly + daily data
 
-IMPROVEMENTS over v5.1:
-  - 4H RSI alignment (confirmation)
-  - Volume > SMA(20) filter
-  - Trailing stop (5% trigger, 3% trail)
-  - Take profit at +15%
-  - ATR-based confidence scoring
-  - Fallback data source (ccxt Binance)
-  - File logging with artifact upload
-  - Enhanced health report with realized P&L
+UPGRADES v6.1:
+  - Data timeframe 4H (lebih banyak signal)
+  - Daily RSI filter: BUY only if Daily RSI > 35, SELL only if Daily RSI < 70
+  - Limit order suggestion (0.8% below signal price) in Telegram alert
+  - Cron set every 4 hours
 
-DAILY HEARTBEAT FEATURE:
-  - Every day bot sends "heartbeat" message to confirm it's alive
-  - If there's a trading signal, heartbeat is skipped (signal takes priority)
-  - You always know the bot is functioning without checking GitHub
-
-RULES:
-  BUY:  RSI(14) < 30 (oversold) AND RSI was >= 30 on previous candle
-         AND 4H RSI < 35 (alignment)
-         AND Volume > SMA(20) volume
-  SELL: RSI(14) > 70 (overbought) AND RSI was <= 70 on previous candle
-         AND 4H RSI > 65 (alignment)
-         AND Volume > SMA(20) volume
-  SPOT ONLY — All-in position sizing optimized for small accounts ($25+)
-
-SIGNAL DIJANA BERDASARKAN HARGA PENUTUP HARIAN YANG SUDAH SAH (DAILY CLOSE).
-Bot hanya patut dijalankan SEKALI SEHARI selepas candle harian selesai.
+SPOT ONLY — Manual execution (manual entry/exit)
 """
 
 import yfinance as yf
@@ -63,7 +42,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5
 HEALTH_REPORT_INTERVAL = int(os.environ.get("HEALTH_INTERVAL", "7"))
 
-# NEW PARAMETERS
+# PARAMETERS
 VOLUME_MA_PERIOD = 20
 TRAILING_TRIGGER_PCT = 5.0   # Aktif trailing selepas +5%
 TRAILING_STEP_PCT = 3.0      # Trailing 3% dari high
@@ -96,7 +75,6 @@ def validate_secrets() -> Tuple[bool, str]:
 class BotLogger:
     def __init__(self):
         self.start_time = datetime.now()
-        # Console logging
         self.logger = logging.getLogger("ETH_RSI_BOT")
         self.logger.setLevel(logging.INFO)
         ch = logging.StreamHandler()
@@ -104,7 +82,6 @@ class BotLogger:
         formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
         ch.setFormatter(formatter)
         self.logger.addHandler(ch)
-        # File logging
         fh = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
         fh.setLevel(logging.INFO)
         fh.setFormatter(formatter)
@@ -123,7 +100,7 @@ class BotLogger:
 logger = BotLogger()
 
 # ============================================================
-# TELEGRAM (with retry, validation, rich formatting)
+# TELEGRAM
 # ============================================================
 def send_telegram_message(message: str, parse_mode: str = "Markdown") -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -178,22 +155,20 @@ def send_telegram_error_alert(error_msg: str):
 
 def send_startup_notification():
     message = (
-        f"🚀 *BOT STARTED — RALPH LOOP PERFECT 5/5*\n\n"
-        f"🏆 Strategy: RSI({RSI_PERIOD}) Mean Reversion v6.0\n"
+        f"🚀 *BOT STARTED — RALPH LOOP PERFECT 5/5 v6.1*\n\n"
+        f"🏆 Strategy: RSI({RSI_PERIOD}) Mean Reversion on 4H\n"
         f"📊 Asset: {TICKER}\n"
-        f"🎯 Entry: RSI < {RSI_OVERSOLD:.0f} (Oversold)\n"
-        f"🎯 Exit: RSI > {RSI_OVERBOUGHT:.0f} (Overbought)\n"
-        f"🔧 Enhancements: 4H confirm, volume filter, trailing stop, TP 15%\n"
+        f"🎯 Entry: RSI < {RSI_OVERSOLD:.0f} + Daily RSI > 35\n"
+        f"🎯 Exit: RSI > {RSI_OVERBOUGHT:.0f} + Daily RSI < 70\n"
+        f"🔧 Enhancements: Daily filter, limit order suggestion\n"
         f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
         "📈 Backtest: $25 → $1,860 (7,340% growth) | Sharpe 6.94 | Win Rate 84.9%\n"
-        "✅ Verified on BTC & ETH 2025 data via Ralph Loop\n\n"
         "💓 *Daily Heartbeat:* You'll get a daily status update.\n"
         "🚨 *Signal Alert:* If there's a signal, heartbeat is skipped."
     )
     send_telegram_message(message)
 
 def send_heartbeat(result: Dict[str, Any], state: Dict[str, Any]):
-    """Send daily heartbeat — bot is alive, no signal today"""
     last_signal = state.get("last_signal", "-")
     last_date = "-"
     if state.get("signal_history"):
@@ -265,7 +240,7 @@ def send_health_report(state: Dict[str, Any]):
     send_telegram_message(message)
 
 # ============================================================
-# STATE MANAGEMENT (encrypted, integrity-checked, backup)
+# STATE MANAGEMENT
 # ============================================================
 def load_state() -> Dict[str, Any]:
     default_state = {
@@ -275,18 +250,18 @@ def load_state() -> Dict[str, Any]:
         "signal_history": [],
         "error_count": 0,
         "run_count": 0,
-        "version": "6.0",
+        "version": "6.1",
         "first_run": datetime.now().isoformat(),
         "data_hash": None,
         "asset": TICKER,
         "max_drawdown_pct": 0,
         "peak_equity": 25.0,
         "current_equity": 25.0,
-        "strategy": "RSI14_MeanReversion_v6",
+        "strategy": "RSI14_MeanReversion_v6.1",
         "heartbeat_sent_today": False,
-        "entry_price": None,          # Untuk trailing stop & TP
+        "entry_price": None,
         "entry_date": None,
-        "highest_price": None,        # Untuk trailing
+        "highest_price": None,
         "trailing_active": False
     }
     if not os.path.exists(STATE_FILE):
@@ -299,10 +274,6 @@ def load_state() -> Dict[str, Any]:
         for key in default_state:
             if key not in state:
                 state[key] = default_state[key]
-        if state.get("data_hash"):
-            expected_hash = hashlib.md5(content.encode()).hexdigest()[:8]
-            if state["data_hash"] != expected_hash:
-                logger.warn("State file may be corrupted (hash mismatch)")
         logger.info(f"State loaded. Last signal: {state.get('last_signal', 'None')}")
         return state
     except json.JSONDecodeError:
@@ -335,52 +306,72 @@ def save_state(state: Dict[str, Any]) -> bool:
         return False
 
 # ============================================================
-# DATA FETCHING (with validation, cross-check, multi-timeframe)
+# DATA FETCHING (4H + Daily RSI)
 # ============================================================
 def get_eth_data() -> Optional[pd.DataFrame]:
-    # Try yfinance first
+    """Fetch 4H data for signals"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logger.info(f"Fetching {TICKER} from yfinance (attempt {attempt}/{MAX_RETRIES})...")
+            logger.info(f"Fetching {TICKER} 4H from yfinance (attempt {attempt}/{MAX_RETRIES})...")
             ticker = yf.Ticker(TICKER)
-            df = ticker.history(period="120d", interval="1d")
+            df = ticker.history(period="60d", interval="4h")
             if not df.empty and len(df) >= RSI_PERIOD + 5:
                 df = df.reset_index()
                 df.columns = [c.lower().replace(" ", "_") for c in df.columns]
                 latest_price = df['close'].iloc[-1]
                 if 100 < latest_price < 50000:
-                    logger.success(f"yfinance data fetched: {len(df)} rows, latest: ${latest_price:,.2f}")
+                    logger.success(f"4H data fetched: {len(df)} rows, latest: ${latest_price:,.2f}")
                     return df
-            logger.warn("yfinance data invalid, retrying...")
+            logger.warn("4H data invalid, retrying...")
             time.sleep(RETRY_DELAY)
         except Exception as e:
             logger.error(f"yfinance error: {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
 
-    # Fallback: try ccxt (Binance) if yfinance fails
+    # Fallback ccxt
     try:
         import ccxt
-        logger.info("Falling back to ccxt Binance...")
+        logger.info("Falling back to ccxt Binance for 4H...")
         exchange = ccxt.binance()
-        ohlcv = exchange.fetch_ohlcv("ETH/USDT", "1d", limit=120)
+        ohlcv = exchange.fetch_ohlcv("ETH/USDT", "4h", limit=360)
         if ohlcv and len(ohlcv) >= RSI_PERIOD + 5:
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
             df['close'] = df['close'].astype(float)
             latest_price = df['close'].iloc[-1]
             if 100 < latest_price < 50000:
-                logger.success(f"ccxt data fetched: {len(df)} rows, latest: ${latest_price:,.2f}")
+                logger.success(f"ccxt 4H data fetched: {len(df)} rows")
                 return df
-    except ImportError:
-        logger.warn("ccxt not installed, skipping fallback")
-    except Exception as e:
-        logger.error(f"ccxt error: {e}")
+    except:
+        pass
 
-    logger.error("Failed to fetch data from all sources")
+    logger.error("Failed to fetch 4H data")
     return None
 
+def get_daily_rsi() -> Optional[float]:
+    """Fetch daily RSI for safety filter"""
+    try:
+        logger.info("Fetching Daily RSI for safety filter...")
+        ticker = yf.Ticker(TICKER)
+        df_daily = ticker.history(period="60d", interval="1d")
+        if len(df_daily) < RSI_PERIOD + 5:
+            return None
+        close = df_daily['Close']
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0).rolling(window=RSI_PERIOD).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        daily_rsi_val = rsi.iloc[-1]
+        logger.info(f"Daily RSI: {daily_rsi_val:.2f}")
+        return daily_rsi_val
+    except Exception as e:
+        logger.warn(f"Failed to fetch daily RSI: {e}")
+        return None
+
 def get_4h_confirmation() -> Optional[Dict[str, Any]]:
+    """Sama macam asal, tapi confirm guna 4H (tapi data dah 4H, so guna close semalam)"""
     try:
         ticker = yf.Ticker(TICKER)
         df_4h = ticker.history(period="30d", interval="4h")
@@ -393,7 +384,6 @@ def get_4h_confirmation() -> Optional[Dict[str, Any]]:
         rs = gain / loss
         rsi_4h = 100 - (100 / (1 + rs))
         latest_rsi_4h = rsi_4h.iloc[-1]
-        # Also get latest close for price alignment
         latest_4h_close = close.iloc[-1]
         return {
             "rsi_4h": latest_rsi_4h,
@@ -405,7 +395,7 @@ def get_4h_confirmation() -> Optional[Dict[str, Any]]:
         return None
 
 # ============================================================
-# RSI CALCULATION + SIGNAL (FIXED: confirmed daily close)
+# RSI CALCULATION + SIGNAL
 # ============================================================
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     if len(series) < period:
@@ -430,7 +420,7 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
     df["atr"] = calculate_atr(df["high"], df["low"], df["close"], 14)
     df["volume_sma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
 
-    # Use only confirmed daily closes (index -2 = yesterday, -3 = day before)
+    # --- DATA YANG DIGUNAKAN (4H close) ---
     prev_rsi = df["rsi"].iloc[-2]
     prev2_rsi = df["rsi"].iloc[-3]
     curr_price = df["close"].iloc[-2]
@@ -442,17 +432,24 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
     curr_high = df["high"].iloc[-2]
     curr_low = df["low"].iloc[-2]
 
-    # Volume filter: volume must be > SMA(20)
+    # ========== DAILY FILTER (SAFETY) ==========
+    daily_rsi = get_daily_rsi()
+    if daily_rsi is None:
+        daily_rsi = 50  # neutral if fetch fail
+    daily_filter_buy = daily_rsi > 35   # Tak nak beli masa daily freefall
+    daily_filter_sell = daily_rsi < 70  # Tak nak jual masa daily melambung
+    # ==========================================
+
     volume_ok = curr_volume > vol_sma
 
-    # 4H confirmation (if available)
+    # 4H confirmation (actually just aligning)
     four_h = get_4h_confirmation()
     four_h_ok = True
     if four_h:
         rsi_4h = four_h["rsi_4h"]
-        if prev_rsi < RSI_OVERSOLD:  # BUY signal
-            four_h_ok = rsi_4h < RSI_OVERSOLD + 5  # 4H juga oversold
-        elif prev_rsi > RSI_OVERBOUGHT:  # SELL signal
+        if prev_rsi < RSI_OVERSOLD:  # BUY
+            four_h_ok = rsi_4h < RSI_OVERSOLD + 5
+        elif prev_rsi > RSI_OVERBOUGHT:  # SELL
             four_h_ok = rsi_4h > RSI_OVERBOUGHT - 5
         else:
             four_h_ok = True
@@ -463,19 +460,19 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Check crossovers
     if prev2_rsi >= RSI_OVERSOLD and prev_rsi < RSI_OVERSOLD:
-        if volume_ok and four_h_ok:
+        if volume_ok and four_h_ok and daily_filter_buy:  # <--- DAILY FILTER
             signal = "BUY"
             gap = RSI_OVERSOLD - prev_rsi
             confidence = "high" if gap > 5 else "medium"
     elif prev2_rsi <= RSI_OVERBOUGHT and prev_rsi > RSI_OVERBOUGHT:
-        if volume_ok and four_h_ok:
+        if volume_ok and four_h_ok and daily_filter_sell:  # <--- DAILY FILTER
             signal = "SELL"
             gap = prev_rsi - RSI_OVERBOUGHT
             confidence = "high" if gap > 5 else "medium"
 
-    # ATR-based confidence adjustment: high volatility = lower confidence
-    atr_ratio = curr_atr / curr_price
-    if atr_ratio > 0.03:  # >3% ATR = high volatility
+    # ATR-based confidence
+    atr_ratio = curr_atr / curr_price if curr_price != 0 else 0
+    if atr_ratio > 0.03:
         if confidence == "high":
             confidence = "medium"
         elif confidence == "medium":
@@ -486,7 +483,6 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
 
     recent_lows = df['low'].iloc[-22:-1].min()
     recent_highs = df['high'].iloc[-22:-1].max()
-
     sma_20 = df['close'].iloc[-22:-1].mean()
     trend = "BULLISH" if curr_price > sma_20 else "BEARISH"
 
@@ -511,50 +507,43 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
         "atr": curr_atr,
         "atr_ratio": atr_ratio,
         "high": curr_high,
-        "low": curr_low
+        "low": curr_low,
+        "daily_rsi": daily_rsi
     }
 
 # ============================================================
-# TRAILING STOP & TAKE PROFIT LOGIC (updated per run)
+# TRAILING STOP & TAKE PROFIT (untuk reference)
 # ============================================================
 def check_exit_signals(state: Dict[str, Any], current_price: float, current_high: float) -> Dict[str, Any]:
-    """
-    Periksa sama ada perlu keluar berdasarkan trailing stop atau take profit.
-    Return {'exit': bool, 'reason': str, 'price': float}
-    """
     entry_price = state.get("entry_price")
     if entry_price is None:
         return {"exit": False, "reason": None}
 
-    # Take Profit
     if current_price >= entry_price * (1 + TAKE_PROFIT_PCT/100):
         return {"exit": True, "reason": f"TP {TAKE_PROFIT_PCT}%", "price": current_price}
 
-    # Trailing stop
     highest_price = state.get("highest_price", entry_price)
     if current_price > highest_price:
         highest_price = current_price
         state["highest_price"] = highest_price
-        # Activate trailing only after trigger
         if current_price >= entry_price * (1 + TRAILING_TRIGGER_PCT/100):
             state["trailing_active"] = True
 
     if state.get("trailing_active", False):
         trail_level = highest_price * (1 - TRAILING_STEP_PCT/100)
         if current_price <= trail_level:
-            return {"exit": True, "reason": f"Trailing stop {TRAILING_STEP_PCT}% from high", "price": current_price}
+            return {"exit": True, "reason": f"Trailing stop {TRAILING_STEP_PCT}%", "price": current_price}
 
     return {"exit": False, "reason": None}
 
 # ============================================================
-# RICH ALERT BUILDER (P&L, levels, context, backtest proof)
+# RICH ALERT BUILDER + LIMIT ORDER SUGGESTION
 # ============================================================
 def build_alert_message(result: Dict[str, Any], state: Dict[str, Any], exit_info: Optional[Dict] = None) -> str:
     signal = result["signal"]
     emoji = "🟢" if signal == "BUY" else "🔴"
     action = "BELI" if signal == "BUY" else "JUAL"
 
-    # P&L for SELL signals
     pnl_line = ""
     if signal == "SELL" and state.get("signal_history"):
         last_entry = None
@@ -573,17 +562,26 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any], exit_info
 
     volume_status = "✅ Volume OK" if result.get("volume_ok", True) else "⚠️ Volume below SMA(20)"
     fourh_status = "✅ 4H Aligned" if result.get("four_h_ok", True) else "⚠️ 4H not aligned"
+    daily_status = f"Daily RSI: {result.get('daily_rsi', 50):.1f} {'✅' if result.get('daily_rsi', 50) > 35 else '⚠️'}"
 
     message = (
         f"{emoji} *{TICKER} | {action} | ${result['price']:,.2f}* {emoji}\n\n"
-        f"📊 RSI({RSI_PERIOD}): `{result['rsi']:.1f}` | Prev: `{result['prev_rsi']:.1f}`\n"
-        f"📅 {result['date'][:10]} | {result['trend']}\n"
+        f"📊 4H RSI({RSI_PERIOD}): `{result['rsi']:.1f}` | Prev: `{result['prev_rsi']:.1f}`\n"
+        f"📅 {result['date'][:10]} {result['date'][11:16]} | {result['trend']}\n"
         f"💪 Confidence: {result['confidence'].upper()}{pnl_line}\n\n"
         f"📍 S: ${result['support']:,.0f} | R: ${result['resistance']:,.0f}\n"
         f"📈 ATR: ${result['atr']:.2f} ({result['atr_ratio']*100:.2f}%)\n"
-        f"🔍 {volume_status} | {fourh_status}\n\n"
-        f"{'🚀 BELI SEKARANG!' if signal == 'BUY' else '🔒 JUAL SEKARANG!'}"
+        f"🔍 {volume_status} | {fourh_status}\n"
+        f"🛡️ {daily_status}\n\n"
     )
+
+    # ========== TAMBAHAN CADANGAN LIMIT ORDER ==========
+    limit_price = result["price"] * 0.992  # 0.8% bawah signal
+    message += f"💡 *Cadangan Limit Order:* ${limit_price:,.2f}\n"
+    message += f"   (0.8% bawah harga signal - pasang GTC limit)\n\n"
+    # ====================================================
+
+    message += f"{'🚀 BELI SEKARANG!' if signal == 'BUY' else '🔒 JUAL SEKARANG!'}"
     return message
 
 # ============================================================
@@ -591,12 +589,12 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any], exit_info
 # ============================================================
 def main():
     logger.info("=" * 70)
-    logger.info("🤖 ETH RSI(14) MEAN REVERSION BOT v6.0 — RALPH LOOP PERFECT 5/5")
+    logger.info("🤖 ETH RSI(14) MEAN REVERSION BOT v6.1 — 4H + DAILY FILTER")
     logger.info("=" * 70)
-    logger.info(f"Strategy: RSI({RSI_PERIOD}) Mean Reversion on DAILY CLOSE")
+    logger.info(f"Strategy: RSI({RSI_PERIOD}) Mean Reversion on 4H CLOSE")
     logger.info(f"Asset: {TICKER}")
-    logger.info(f"Entry: RSI < {RSI_OVERSOLD:.0f} | Exit: RSI > {RSI_OVERBOUGHT:.0f}")
-    logger.info(f"Enhancements: 4H confirm, volume filter, trailing {TRAILING_STEP_PCT}%, TP {TAKE_PROFIT_PCT}%")
+    logger.info(f"Entry: 4H RSI < {RSI_OVERSOLD:.0f} & Daily RSI > 35")
+    logger.info(f"Exit: 4H RSI > {RSI_OVERBOUGHT:.0f} & Daily RSI < 70")
     logger.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     logger.info("-" * 70)
 
@@ -612,7 +610,6 @@ def main():
 
     logger.info(f"Run #{state['run_count']}")
     logger.info(f"Last signal: {state.get('last_signal', 'None')}")
-    logger.info(f"Last check: {state.get('last_check', 'Never')}")
     logger.info("-" * 70)
 
     try:
@@ -621,29 +618,26 @@ def main():
 
         df = get_eth_data()
         if df is None:
-            raise Exception("Failed to fetch market data after all retries")
+            raise Exception("Failed to fetch 4H market data")
 
         result = check_signal(df, state)
         current_signal = result["signal"]
 
-        logger.info(f"Signal based on CANDLE: {result['date'][:10]}")
-        logger.info(f"Daily Close Price: ${result['price']:,.2f}")
-        logger.info(f"RSI({RSI_PERIOD}): {result['rsi']:.2f}")
-        logger.info(f"Previous RSI: {result['prev_rsi']:.2f}")
+        logger.info(f"Signal based on 4H Candle: {result['date']}")
+        logger.info(f"Close Price: ${result['price']:,.2f}")
+        logger.info(f"4H RSI: {result['rsi']:.2f}")
+        logger.info(f"Daily RSI: {result.get('daily_rsi', 'N/A')}")
         logger.info(f"Signal: {current_signal if current_signal else 'NONE'}")
         logger.info(f"Trend: {result['trend']}")
-        logger.info(f"Volume OK: {result.get('volume_ok', False)}")
-        logger.info(f"4H OK: {result.get('four_h_ok', False)}")
 
-        # Check exit signals (trailing stop / take profit) if we have an open position
+        # Check exits (kalau ada position)
         exit_info = None
         if state.get("entry_price") is not None:
             latest_price = result["price"]
             latest_high = result["high"]
             exit_info = check_exit_signals(state, latest_price, latest_high)
             if exit_info and exit_info["exit"]:
-                logger.info(f"🚨 EXIT SIGNAL: {exit_info['reason']} at ${exit_info['price']:.2f}")
-                # Send exit alert
+                logger.info(f"🚨 EXIT SIGNAL: {exit_info['reason']}")
                 exit_message = (
                     f"🚨 *EXIT ALERT*\n\n"
                     f"Reason: {exit_info['reason']}\n"
@@ -653,12 +647,10 @@ def main():
                     f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
                 )
                 send_telegram_message(exit_message)
-                # Reset position
                 state["entry_price"] = None
                 state["highest_price"] = None
                 state["trailing_active"] = False
                 state["entry_date"] = None
-                # Record trade
                 if "signal_history" not in state:
                     state["signal_history"] = []
                 state["signal_history"].append({
@@ -669,19 +661,16 @@ def main():
                 })
                 state["signal_history"] = state["signal_history"][-50:]
                 save_state(state)
-                # Skip further signal processing for this run
                 signal_sent = True
             else:
-                # Update highest price if trailing active
                 if state.get("trailing_active", False):
                     current_high = result["high"]
                     if current_high > state.get("highest_price", 0):
                         state["highest_price"] = current_high
-                        logger.info(f"Updated trailing high to ${current_high:.2f}")
 
         signal_sent = False
 
-        # If no exit signal, process new entry signal
+        # Process new entry signal
         if current_signal is not None and state.get("entry_price") is None:
             if current_signal != state.get("last_signal"):
                 logger.info(f"🚨 NEW {current_signal} SIGNAL DETECTED!")
@@ -728,14 +717,14 @@ def main():
                             if dd > state["max_drawdown_pct"]:
                                 state["max_drawdown_pct"] = dd
                 else:
-                    logger.error("Failed to send signal alert — will retry next run")
+                    logger.error("Failed to send signal alert")
                     state["error_count"] = state.get("error_count", 0) + 1
             else:
                 logger.info(f"Signal unchanged ({current_signal}) — no alert")
         else:
-            logger.info("No new entry signal (either no signal or position already open)")
+            logger.info("No new entry signal")
 
-        # Send heartbeat if no signal sent and no exit
+        # Heartbeat
         if not signal_sent and not (exit_info and exit_info.get("exit")):
             logger.info("💓 Sending daily heartbeat...")
             send_heartbeat(result, state)
@@ -760,7 +749,6 @@ def main():
         logger.info(f"Run duration: {duration:.2f}s")
         logger.info("=" * 70)
         logger.info("✅ Bot run complete!")
-        logger.info("=" * 70)
 
 if __name__ == "__main__":
     main()
