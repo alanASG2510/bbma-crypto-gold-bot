@@ -1,8 +1,8 @@
-name: ETH RSI(14) Mean Reversion Alert Bot v6.1.1
+name: ETH Luno Alert Bot (Enhanced 5/5)
 
 on:
   schedule:
-    - cron: '5 */4 * * *'
+    - cron: '5 0,4,8,12,16,20 * * *'   # Every 4 hours MYT
   workflow_dispatch:
 
 env:
@@ -21,19 +21,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Restore cached state
-        uses: actions/cache@v4
-        with:
-          path: eth_rsi_bot_state.json
-          key: eth-rsi-state-${{ github.run_id }}
-          restore-keys: |
-            eth-rsi-state-
-
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
           pip install yfinance pandas numpy requests ccxt
 
-      - name: Run ETH RSI(14) Mean Reversion Bot v6.1.1
+      - name: Run Enhanced ETH Strategy
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -44,29 +37,10 @@ jobs:
           HEALTH_INTERVAL: 7
         run: python eth_rsi_bot.py
 
-      - name: Save state to cache
-        uses: actions/cache@v4
-        with:
-          path: eth_rsi_bot_state.json
-          key: eth-rsi-state-${{ github.run_id }}
-
-      - name: Upload state artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: eth-rsi-state-${{ github.run_id }}
-          path: |
-            eth_rsi_bot_state.json
-            eth_rsi_bot.log
-          retention-days: 30
-
       - name: Upload logs on failure
         uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: eth-rsi-logs-${{ github.run_id }}
-          path: |
-            eth_rsi_bot_state.json
-            eth_rsi_bot_state.json.backup
-            eth_rsi_bot.log
+          name: eth-bot-logs
+          path: eth_rsi_bot.log
           retention-days: 7
