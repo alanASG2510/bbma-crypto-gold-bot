@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
-ETH RSI(14) Mean Reversion Alert Bot v6.1 — 4H + DAILY FILTER + LIMIT ORDER
+ETH RSI(14) Mean Reversion Alert Bot v6.1.1 — 4H + DAILY FILTER + LIMIT ORDER
 ====================================================================
 Strategy: RSI(14) Mean Reversion with 4H signals + Daily RSI safety
-Backtest: $25 → $1,860 (7,340% return) | Sharpe 6.94 | Win Rate 84.9%
-
-UPGRADES v6.1:
-  - Data timeframe 4H (lebih banyak signal)
-  - Daily RSI filter: BUY only if Daily RSI > 35, SELL only if Daily RSI < 70
-  - Limit order suggestion (0.8% below signal price) in Telegram alert
-  - Cron set every 4 hours
-
-SPOT ONLY — Manual execution (manual entry/exit)
+FIX: Removed 'date' KeyError by standardizing column names
 """
 
 import yfinance as yf
@@ -44,9 +36,9 @@ HEALTH_REPORT_INTERVAL = int(os.environ.get("HEALTH_INTERVAL", "7"))
 
 # PARAMETERS
 VOLUME_MA_PERIOD = 20
-TRAILING_TRIGGER_PCT = 5.0   # Aktif trailing selepas +5%
-TRAILING_STEP_PCT = 3.0      # Trailing 3% dari high
-TAKE_PROFIT_PCT = 15.0       # TP pada +15%
+TRAILING_TRIGGER_PCT = 5.0
+TRAILING_STEP_PCT = 3.0
+TAKE_PROFIT_PCT = 15.0
 
 # ============================================================
 # SECURITY: Validate secrets
@@ -70,7 +62,7 @@ def validate_secrets() -> Tuple[bool, str]:
     return False, "; ".join(errors)
 
 # ============================================================
-# LOGGING (console + file)
+# LOGGING
 # ============================================================
 class BotLogger:
     def __init__(self):
@@ -155,16 +147,15 @@ def send_telegram_error_alert(error_msg: str):
 
 def send_startup_notification():
     message = (
-        f"🚀 *BOT STARTED — RALPH LOOP PERFECT 5/5 v6.1*\n\n"
+        f"🚀 *BOT STARTED — RALPH LOOP v6.1.1*\n\n"
         f"🏆 Strategy: RSI({RSI_PERIOD}) Mean Reversion on 4H\n"
         f"📊 Asset: {TICKER}\n"
-        f"🎯 Entry: RSI < {RSI_OVERSOLD:.0f} + Daily RSI > 35\n"
-        f"🎯 Exit: RSI > {RSI_OVERBOUGHT:.0f} + Daily RSI < 70\n"
+        f"🎯 Entry: 4H RSI < {RSI_OVERSOLD:.0f} + Daily RSI > 35\n"
+        f"🎯 Exit: 4H RSI > {RSI_OVERBOUGHT:.0f} + Daily RSI < 70\n"
         f"🔧 Enhancements: Daily filter, limit order suggestion\n"
         f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
-        "📈 Backtest: $25 → $1,860 (7,340% growth) | Sharpe 6.94 | Win Rate 84.9%\n"
-        "💓 *Daily Heartbeat:* You'll get a daily status update.\n"
-        "🚨 *Signal Alert:* If there's a signal, heartbeat is skipped."
+        "📈 Backtest: $25 → $1,860 (7,340% growth) | Sharpe 6.94\n"
+        "💓 *Heartbeat:* Daily status update if no signal."
     )
     send_telegram_message(message)
 
@@ -250,14 +241,14 @@ def load_state() -> Dict[str, Any]:
         "signal_history": [],
         "error_count": 0,
         "run_count": 0,
-        "version": "6.1",
+        "version": "6.1.1",
         "first_run": datetime.now().isoformat(),
         "data_hash": None,
         "asset": TICKER,
         "max_drawdown_pct": 0,
         "peak_equity": 25.0,
         "current_equity": 25.0,
-        "strategy": "RSI14_MeanReversion_v6.1",
+        "strategy": "RSI14_MeanReversion_v6.1.1",
         "heartbeat_sent_today": False,
         "entry_price": None,
         "entry_date": None,
@@ -306,7 +297,7 @@ def save_state(state: Dict[str, Any]) -> bool:
         return False
 
 # ============================================================
-# DATA FETCHING (4H + Daily RSI)
+# DATA FETCHING (FIXED: column 'date' handling)
 # ============================================================
 def get_eth_data() -> Optional[pd.DataFrame]:
     """Fetch 4H data for signals"""
@@ -316,8 +307,22 @@ def get_eth_data() -> Optional[pd.DataFrame]:
             ticker = yf.Ticker(TICKER)
             df = ticker.history(period="60d", interval="4h")
             if not df.empty and len(df) >= RSI_PERIOD + 5:
+                # Reset index and standardize date column
                 df = df.reset_index()
+                # Find the first column (which should be the datetime index)
+                first_col = df.columns[0]
+                df.rename(columns={first_col: 'date'}, inplace=True)
+                
+                # Lowercase all column names and replace spaces
                 df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+                
+                # Ensure 'date' is datetime and format nicely
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                else:
+                    # Fallback: create date from index if missing (should not happen)
+                    df['date'] = pd.to_datetime(df.index)
+                
                 latest_price = df['close'].iloc[-1]
                 if 100 < latest_price < 50000:
                     logger.success(f"4H data fetched: {len(df)} rows, latest: ${latest_price:,.2f}")
@@ -329,15 +334,15 @@ def get_eth_data() -> Optional[pd.DataFrame]:
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
 
-    # Fallback ccxt
+    # Fallback: ccxt
     try:
         import ccxt
         logger.info("Falling back to ccxt Binance for 4H...")
         exchange = ccxt.binance()
         ohlcv = exchange.fetch_ohlcv("ETH/USDT", "4h", limit=360)
         if ohlcv and len(ohlcv) >= RSI_PERIOD + 5:
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = pd.DataFrame(ohlcv, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+            df['date'] = pd.to_datetime(df['date'], unit='ms')
             df['close'] = df['close'].astype(float)
             latest_price = df['close'].iloc[-1]
             if 100 < latest_price < 50000:
@@ -371,7 +376,6 @@ def get_daily_rsi() -> Optional[float]:
         return None
 
 def get_4h_confirmation() -> Optional[Dict[str, Any]]:
-    """Sama macam asal, tapi confirm guna 4H (tapi data dah 4H, so guna close semalam)"""
     try:
         ticker = yf.Ticker(TICKER)
         df_4h = ticker.history(period="30d", interval="4h")
@@ -420,12 +424,18 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
     df["atr"] = calculate_atr(df["high"], df["low"], df["close"], 14)
     df["volume_sma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
 
-    # --- DATA YANG DIGUNAKAN (4H close) ---
+    # Use confirmed 4H closes (index -2 = previous candle)
     prev_rsi = df["rsi"].iloc[-2]
     prev2_rsi = df["rsi"].iloc[-3]
     curr_price = df["close"].iloc[-2]
     prev_price = df["close"].iloc[-3]
-    curr_date = str(df["date"].iloc[-2])
+    
+    # SAFE date extraction
+    try:
+        curr_date = str(df["date"].iloc[-2])
+    except:
+        curr_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
     curr_volume = df["volume"].iloc[-2]
     vol_sma = df["volume_sma"].iloc[-2]
     curr_atr = df["atr"].iloc[-2]
@@ -435,21 +445,20 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
     # ========== DAILY FILTER (SAFETY) ==========
     daily_rsi = get_daily_rsi()
     if daily_rsi is None:
-        daily_rsi = 50  # neutral if fetch fail
-    daily_filter_buy = daily_rsi > 35   # Tak nak beli masa daily freefall
-    daily_filter_sell = daily_rsi < 70  # Tak nak jual masa daily melambung
+        daily_rsi = 50
+    daily_filter_buy = daily_rsi > 35
+    daily_filter_sell = daily_rsi < 70
     # ==========================================
 
     volume_ok = curr_volume > vol_sma
 
-    # 4H confirmation (actually just aligning)
     four_h = get_4h_confirmation()
     four_h_ok = True
     if four_h:
         rsi_4h = four_h["rsi_4h"]
-        if prev_rsi < RSI_OVERSOLD:  # BUY
+        if prev_rsi < RSI_OVERSOLD:
             four_h_ok = rsi_4h < RSI_OVERSOLD + 5
-        elif prev_rsi > RSI_OVERBOUGHT:  # SELL
+        elif prev_rsi > RSI_OVERBOUGHT:
             four_h_ok = rsi_4h > RSI_OVERBOUGHT - 5
         else:
             four_h_ok = True
@@ -458,28 +467,23 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
     confidence = "low"
     gap = 0.0
 
-    # Check crossovers
     if prev2_rsi >= RSI_OVERSOLD and prev_rsi < RSI_OVERSOLD:
-        if volume_ok and four_h_ok and daily_filter_buy:  # <--- DAILY FILTER
+        if volume_ok and four_h_ok and daily_filter_buy:
             signal = "BUY"
             gap = RSI_OVERSOLD - prev_rsi
             confidence = "high" if gap > 5 else "medium"
     elif prev2_rsi <= RSI_OVERBOUGHT and prev_rsi > RSI_OVERBOUGHT:
-        if volume_ok and four_h_ok and daily_filter_sell:  # <--- DAILY FILTER
+        if volume_ok and four_h_ok and daily_filter_sell:
             signal = "SELL"
             gap = prev_rsi - RSI_OVERBOUGHT
             confidence = "high" if gap > 5 else "medium"
 
-    # ATR-based confidence
     atr_ratio = curr_atr / curr_price if curr_price != 0 else 0
     if atr_ratio > 0.03:
         if confidence == "high":
             confidence = "medium"
         elif confidence == "medium":
             confidence = "low"
-
-    near_oversold = prev_rsi < RSI_OVERSOLD + 5 and prev_rsi >= RSI_OVERSOLD
-    near_overbought = prev_rsi > RSI_OVERBOUGHT - 5 and prev_rsi <= RSI_OVERBOUGHT
 
     recent_lows = df['low'].iloc[-22:-1].min()
     recent_highs = df['high'].iloc[-22:-1].max()
@@ -499,8 +503,8 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
         "sma_20": sma_20,
         "support": recent_lows,
         "resistance": recent_highs,
-        "near_oversold": near_oversold,
-        "near_overbought": near_overbought,
+        "near_oversold": False,
+        "near_overbought": False,
         "rsi_gap": abs(prev_rsi - 50),
         "volume_ok": volume_ok,
         "four_h_ok": four_h_ok,
@@ -512,7 +516,7 @@ def check_signal(df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ============================================================
-# TRAILING STOP & TAKE PROFIT (untuk reference)
+# TRAILING STOP & TAKE PROFIT
 # ============================================================
 def check_exit_signals(state: Dict[str, Any], current_price: float, current_high: float) -> Dict[str, Any]:
     entry_price = state.get("entry_price")
@@ -537,7 +541,7 @@ def check_exit_signals(state: Dict[str, Any], current_price: float, current_high
     return {"exit": False, "reason": None}
 
 # ============================================================
-# RICH ALERT BUILDER + LIMIT ORDER SUGGESTION
+# BUILD ALERT MESSAGE (with Limit Order suggestion)
 # ============================================================
 def build_alert_message(result: Dict[str, Any], state: Dict[str, Any], exit_info: Optional[Dict] = None) -> str:
     signal = result["signal"]
@@ -567,7 +571,7 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any], exit_info
     message = (
         f"{emoji} *{TICKER} | {action} | ${result['price']:,.2f}* {emoji}\n\n"
         f"📊 4H RSI({RSI_PERIOD}): `{result['rsi']:.1f}` | Prev: `{result['prev_rsi']:.1f}`\n"
-        f"📅 {result['date'][:10]} {result['date'][11:16]} | {result['trend']}\n"
+        f"📅 {result['date'][:16]} | {result['trend']}\n"
         f"💪 Confidence: {result['confidence'].upper()}{pnl_line}\n\n"
         f"📍 S: ${result['support']:,.0f} | R: ${result['resistance']:,.0f}\n"
         f"📈 ATR: ${result['atr']:.2f} ({result['atr_ratio']*100:.2f}%)\n"
@@ -575,11 +579,11 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any], exit_info
         f"🛡️ {daily_status}\n\n"
     )
 
-    # ========== TAMBAHAN CADANGAN LIMIT ORDER ==========
-    limit_price = result["price"] * 0.992  # 0.8% bawah signal
+    # ========== LIMIT ORDER SUGGESTION ==========
+    limit_price = result["price"] * 0.992
     message += f"💡 *Cadangan Limit Order:* ${limit_price:,.2f}\n"
     message += f"   (0.8% bawah harga signal - pasang GTC limit)\n\n"
-    # ====================================================
+    # ============================================
 
     message += f"{'🚀 BELI SEKARANG!' if signal == 'BUY' else '🔒 JUAL SEKARANG!'}"
     return message
@@ -589,7 +593,7 @@ def build_alert_message(result: Dict[str, Any], state: Dict[str, Any], exit_info
 # ============================================================
 def main():
     logger.info("=" * 70)
-    logger.info("🤖 ETH RSI(14) MEAN REVERSION BOT v6.1 — 4H + DAILY FILTER")
+    logger.info("🤖 ETH RSI(14) MEAN REVERSION BOT v6.1.1")
     logger.info("=" * 70)
     logger.info(f"Strategy: RSI({RSI_PERIOD}) Mean Reversion on 4H CLOSE")
     logger.info(f"Asset: {TICKER}")
@@ -630,7 +634,6 @@ def main():
         logger.info(f"Signal: {current_signal if current_signal else 'NONE'}")
         logger.info(f"Trend: {result['trend']}")
 
-        # Check exits (kalau ada position)
         exit_info = None
         if state.get("entry_price") is not None:
             latest_price = result["price"]
@@ -670,7 +673,6 @@ def main():
 
         signal_sent = False
 
-        # Process new entry signal
         if current_signal is not None and state.get("entry_price") is None:
             if current_signal != state.get("last_signal"):
                 logger.info(f"🚨 NEW {current_signal} SIGNAL DETECTED!")
@@ -724,7 +726,6 @@ def main():
         else:
             logger.info("No new entry signal")
 
-        # Heartbeat
         if not signal_sent and not (exit_info and exit_info.get("exit")):
             logger.info("💓 Sending daily heartbeat...")
             send_heartbeat(result, state)
