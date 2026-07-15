@@ -13,6 +13,9 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, Dict, List
 
+import pandas as pd
+import yfinance as yf
+
 # ─── CONFIG ─────────────────────────────────────────────────────────────
 INITIAL_CAPITAL = 50.0        # RM50
 STOP_LOSS_PCT = 12.0          # 12% trailing stop
@@ -63,9 +66,6 @@ class TradeState:
 
 def fetch_eth_data() -> pd.DataFrame:
     """Fetch last 250 days of ETH-USD data from Yahoo Finance."""
-    import pandas as pd
-    import yfinance as yf
-
     ticker = yf.Ticker("ETH-USD")
     df = ticker.history(period="250d", interval="1d")
     df = df.reset_index()
@@ -243,8 +243,6 @@ _Go to Luno app to execute this trade manually._
     return msg
 
 def main():
-    import pandas as pd
-
     print("=" * 60)
     print("ETH Momentum Snap - Signal Detector")
     print(f"Running at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
